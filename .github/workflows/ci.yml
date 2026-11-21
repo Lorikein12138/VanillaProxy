@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  ci-required:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check whitespace
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git diff --check HEAD^1 HEAD
+            git diff --check HEAD^2 HEAD
+          else
+            git show --check --oneline --diff-merges=first-parent HEAD
+          fi
+
+      - name: Check repository ownership
+        shell: bash
+        run: test "$(cat .github/CODEOWNERS)" = '* @Lorikein12138'
