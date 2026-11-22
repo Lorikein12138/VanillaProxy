@@ -2,6 +2,7 @@
 
 SHELL := bash
 GO_PKGS = $(shell go list ./... | grep -v '/frontend/node_modules/')
+PATCHED_XRAY_GO = sh scripts/build-patched-xray.sh
 FRONTEND = frontend
 
 .DEFAULT_GOAL := help
@@ -50,19 +51,19 @@ typecheck: ## tsc --noEmit
 
 .PHONY: test-go
 test-go: dist-stub ## Go tests (shuffle, no cache)
-	go test -shuffle=on -count=1 $(GO_PKGS)
+	$(PATCHED_XRAY_GO) test -shuffle=on -count=1 $(GO_PKGS)
 
 .PHONY: race
 # internal/web/service runs ~10x slower under -race and overruns go test's 10m default.
 race: dist-stub ## Go tests with the race detector (needs a C compiler)
-	go test -race -shuffle=on -count=1 -timeout 25m $(GO_PKGS)
+	$(PATCHED_XRAY_GO) test -race -shuffle=on -count=1 -timeout 25m $(GO_PKGS)
 
 .PHONY: node-e2e
 # Two real panel processes (master + node); test-go only runs nodee2e as a skip.
 NODE_E2E_BIN = $(CURDIR)/.cache/node-e2e/x-ui$(shell go env GOEXE)
 node-e2e: dist-stub ## Master+node sync end to end with two real panel processes
-	go build -o $(NODE_E2E_BIN) .
-	XUI_NODE_E2E_BINARY=$(NODE_E2E_BIN) go test -count=1 -timeout 20m -v ./internal/nodee2e/
+	$(PATCHED_XRAY_GO) build -o "$(NODE_E2E_BIN)" .
+	XUI_NODE_E2E_BINARY="$(NODE_E2E_BIN)" $(PATCHED_XRAY_GO) test -count=1 -timeout 20m -v ./internal/nodee2e/
 
 .PHONY: test-fe
 test-fe: ## Frontend tests (vitest)
@@ -81,7 +82,7 @@ build-fe: ## Build the Vite bundles into internal/web/dist
 
 .PHONY: build
 build: build-fe ## Build the frontend then the Go binary
-	go build ./...
+	$(PATCHED_XRAY_GO) build ./...
 
 .PHONY: build-storybook
 build-storybook: ## Build the static Storybook (compile-checks all stories)

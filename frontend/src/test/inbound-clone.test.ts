@@ -28,6 +28,17 @@ function sourceInbound() {
 }
 
 describe('buildClonePayload', () => {
+  it('keeps account ownership within the original local panel', () => {
+    const settings = { accounts: [{ user: 'proxy-user', pass: 'secret', bandwidthClientId: 15 }] };
+    const remote = new DBInbound({ protocol: 'http', nodeId: 5, settings });
+    const local = new DBInbound({ protocol: 'http', settings });
+
+    expect(JSON.parse(buildClonePayload(remote, 23456, null).settings)).toEqual({
+      accounts: [{ user: 'proxy-user', pass: 'secret' }],
+    });
+    expect(JSON.parse(buildClonePayload(local, 23456, null).settings)).toEqual(settings);
+  });
+
   it('omits nodeId for a local-panel target so the row stays panel-local', () => {
     const payload = buildClonePayload(sourceInbound(), 23456, null);
     expect(payload).not.toHaveProperty('nodeId');

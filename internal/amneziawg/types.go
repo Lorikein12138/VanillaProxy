@@ -49,6 +49,7 @@ type Obfuscation31 struct {
 // same role SecretEntry.Name plays for mtproto.
 type Peer struct {
 	Email        string
+	TrafficID    int `json:"-"` // Stable panel ledger row for managed kernel accounting.
 	PublicKey    string
 	PresharedKey string
 	AllowedIPs   []string

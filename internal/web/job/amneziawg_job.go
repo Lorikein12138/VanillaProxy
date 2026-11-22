@@ -2,11 +2,13 @@ package job
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgkern"
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthruntime"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
@@ -53,6 +55,60 @@ func (j *AmneziaWGJob) Run() {
 	if amneziawgnet.BridgesStale() {
 		j.xrayService.SetToNeedRestart()
 	}
+}
+
+// ReconcileBandwidthKernel applies the committed kernel-mode inventory even
+// when the managed node has no Xray process or its embedded relays are down.
+func (j *AmneziaWGJob) ReconcileBandwidthKernel(panel *bandwidthruntime.PanelRuntime) error {
+	return j.ReconcileBandwidthKernelPolicy(panel, false)
+}
+
+// ReconcileBandwidthKernelPolicy stops all kernel listeners when policy
+// activation fails after changing the active account snapshot.
+func (j *AmneziaWGJob) ReconcileBandwidthKernelPolicy(panel *bandwidthruntime.PanelRuntime, stop bool) error {
+	return service.ApplyBandwidthKernelAmneziaWG(panel, func() ([]*xray.ClientTraffic, error) {
+		manager := amneziawgkern.GetManager()
+		var kernel []amneziawgkern.Desired
+		var err error
+		if !stop {
+			var desired []amneziawg.Instance
+			desired, err = j.inboundService.DesiredAmneziaWGInstances()
+			if err == nil {
+				_, kernel = splitAmneziaWGDatapaths(desired)
+			}
+		}
+		quiesceErr := manager.QuiesceBandwidthChanges(kernel)
+		// Use the installed generation and its actual peers, even if the
+		// committed inventory removed or renamed a peer before this tick.
+		samples := readKernelTraffic(nil, manager, amneziawgkern.GetCollector(), amneziawgkern.Dump)
+		return samples, errors.Join(err, quiesceErr, reconcileBandwidthKernel(kernel, amneziawgnet.GetManager(), manager))
+	})
+}
+
+func (j *AmneziaWGJob) RunBandwidthKernel(panel *bandwidthruntime.PanelRuntime) {
+	if err := j.ReconcileBandwidthKernel(panel); err != nil {
+		logger.Warning("bandwidth-managed kernel AmneziaWG reconcile failed:", err)
+	}
+}
+
+// StopBandwidthKernel runs after the managed node refuses new reconcile work.
+// Sample the last generation and stop it before waiting for all writes.
+func (j *AmneziaWGJob) StopBandwidthKernel(panel *bandwidthruntime.PanelRuntime) error {
+	manager := amneziawgkern.GetManager()
+	quiesceErr := manager.QuiesceBandwidthChanges(nil)
+	samples := readKernelTraffic(nil, manager, amneziawgkern.GetCollector(), amneziawgkern.Dump)
+	return errors.Join(quiesceErr, manager.ReconcileBandwidth(nil), service.FlushBandwidthKernelTraffic(panel, samples))
+}
+
+type bandwidthKernelManager interface {
+	ReconcileBandwidth([]amneziawgkern.Desired) error
+}
+
+func reconcileBandwidthKernel(desired []amneziawgkern.Desired, embedded interface{ Remove(int) }, kernel bandwidthKernelManager) error {
+	for _, d := range desired {
+		embedded.Remove(d.Instance.Id)
+	}
+	return kernel.ReconcileBandwidth(desired)
 }
 
 // FlushKernelTraffic charges what kernel interfaces counted since the last
@@ -199,6 +255,16 @@ type kernelTrafficDumper func(string) ([]amneziawgkern.PeerStat, error)
 // collectKernelTrafficWith reads every managed interface, not only desired
 // ones, so a peer or inbound that is about to be dropped is still charged.
 func collectKernelTrafficWith(inboundService *service.InboundService, kernel []amneziawgkern.Desired, manager kernelTrafficManager, collector *amneziawgkern.Collector, dump kernelTrafficDumper) {
+	traffics := readKernelTraffic(kernel, manager, collector, dump)
+	if len(traffics) == 0 {
+		return
+	}
+	if _, _, err := inboundService.AddTraffic(nil, traffics); err != nil {
+		logger.Warning("amneziawg job: recording kernel-mode traffic:", err)
+	}
+}
+
+func readKernelTraffic(kernel []amneziawgkern.Desired, manager kernelTrafficManager, collector *amneziawgkern.Collector, dump kernelTrafficDumper) []*xray.ClientTraffic {
 	emailsByID := make(map[int]map[string]string, len(kernel))
 	for _, d := range kernel {
 		emails := make(map[string]string, len(d.Instance.Peers))
@@ -232,22 +298,30 @@ func collectKernelTrafficWith(inboundService *service.InboundService, kernel []a
 		}
 
 		emails, desired := emailsByID[id]
+		if state.PeerEmails != nil {
+			emails, desired = state.PeerEmails, true
+		}
 		// Adopted: downtime traffic is unknowable without durable accounting state.
 		// Otherwise deltas, never totals: counters restart at zero on every rebuild.
 		if !state.Adopted {
 			for _, delta := range collector.Delta(state.Name, stats) {
 				email := emails[delta.PublicKey]
-				if email == "" {
+				trafficID := state.PeerTrafficIDs[delta.PublicKey]
+				if state.PeerEmails != nil && trafficID <= 0 {
+					continue
+				}
+				if state.PeerEmails == nil && email == "" {
 					email = collector.EmailFor(state.Name, delta.PublicKey)
 				}
 				if email == "" {
 					continue
 				}
 				traffics = append(traffics, &xray.ClientTraffic{
-					InboundId: id,
-					Email:     email,
-					Up:        delta.Up,
-					Down:      delta.Down,
+					InboundId:    id,
+					Email:        email,
+					AWGTrafficID: trafficID,
+					Up:           delta.Up,
+					Down:         delta.Down,
 				})
 			}
 		}
@@ -258,12 +332,5 @@ func collectKernelTrafficWith(inboundService *service.InboundService, kernel []a
 		collector.ObserveHandshakes(state.Name, stats)
 	}
 
-	if len(traffics) == 0 {
-		return
-	}
-	// A client that just crossed its limit is disabled here; the next reconcile
-	// tick drops its peer from the interface, which is what cuts it off.
-	if _, _, err := inboundService.AddTraffic(nil, traffics); err != nil {
-		logger.Warning("amneziawg job: recording kernel-mode traffic:", err)
-	}
+	return traffics
 }

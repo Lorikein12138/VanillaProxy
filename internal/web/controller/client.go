@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthruntime"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/entity"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
@@ -41,10 +42,15 @@ type ClientController struct {
 	xrayService    service.XrayService
 	settingService service.SettingService
 	happGenerator  service.HappLinkGenerator
+	bandwidth      *bandwidthruntime.PanelRuntime
 }
 
 func NewClientController(g *gin.RouterGroup) *ClientController {
-	a := &ClientController{}
+	return newClientController(g, nil)
+}
+
+func newClientController(g *gin.RouterGroup, bandwidth *bandwidthruntime.PanelRuntime) *ClientController {
+	a := &ClientController{bandwidth: bandwidth}
 	a.happGenerator = service.NewHappService(&a.clientService, &a.settingService)
 	a.initRouter(g)
 	return a
@@ -68,6 +74,8 @@ func (a *ClientController) initRouter(g *gin.RouterGroup) {
 	g.POST("/:email/attach", a.attach)
 	g.POST("/:email/detach", a.detach)
 	g.POST("/:email/externalLinks", a.setExternalLinks)
+	g.GET("/:email/bandwidth", a.getBandwidth)
+	g.POST("/:email/bandwidth", a.setBandwidth)
 	g.GET("/export", a.export)
 	g.POST("/import", a.importClients)
 	g.POST("/delOrphans", a.delOrphans)

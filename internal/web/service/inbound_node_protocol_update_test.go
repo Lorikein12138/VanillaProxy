@@ -8,6 +8,34 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
+func TestBandwidthProxyBindingsStayOnTheirLocalPanel(t *testing.T) {
+	setupConflictDB(t)
+	const settings = `{"users":[{"user":"ignored","pass":"unused","bandwidthClientId":21}],"accounts":[{"user":"proxy-user","pass":"secret","bandwidthClientId":11}]}`
+	local := model.Inbound{Port: 4061, Protocol: model.HTTP, Settings: settings}
+	if _, _, err := (&InboundService{}).AddInbound(&local); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(local.Settings, `"bandwidthClientId":11`) {
+		t.Fatal("an explicit local assignment was stripped")
+	}
+	foreign := model.Inbound{Port: 4062, Protocol: model.HTTP, Settings: settings}
+	push := &InboundService{FromNodeSync: true}
+	if _, _, err := push.AddInbound(&foreign); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(foreign.Settings, "bandwidthClientId") || !strings.Contains(foreign.Settings, `"user":"proxy-user"`) {
+		t.Fatal("incoming node add forwarded a foreign ID or lost proxy credentials")
+	}
+	update := local
+	update.Settings = `{"accounts":[{"user":"proxy-user","pass":"replacement"}]}`
+	if _, _, err := push.UpdateInbound(&update); err == nil || !strings.Contains(err.Error(), "must be edited on their local panel") {
+		t.Fatalf("node update overwrote an explicit local binding: %v", err)
+	}
+	if updated, _, err := (&InboundService{}).UpdateInbound(&local); err != nil || !strings.Contains(updated.Settings, "bandwidthClientId") {
+		t.Fatalf("local edit lost the current assignment: %v", err)
+	}
+}
+
 // A node-managed inbound arrives by adoption, so its protocol can be one the
 // master never assigns itself. Editing its share metadata must still work.
 func TestUpdateInbound_NodeMtprotoShareAddrIsEditable(t *testing.T) {

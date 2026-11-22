@@ -1010,7 +1010,7 @@ func (s *ClientService) BulkDelete(inboundSvc *InboundService, emails []string, 
 				}
 			}
 			for _, batch := range chunkInts(successIds, sqlInChunk) {
-				if e := tx.Where("id IN ?", batch).Delete(&model.ClientRecord{}).Error; e != nil {
+				if e := deleteClientRecords(tx, batch); e != nil {
 					return e
 				}
 			}
@@ -1019,6 +1019,7 @@ func (s *ClientService) BulkDelete(inboundSvc *InboundService, emails []string, 
 			withdrawClientTombstones(successEmails...)
 			return result, needRestart, err
 		}
+		requestBandwidthProxyOwnerReconcile(successIds...)
 	}
 
 	result.Deleted = len(successEmails)
@@ -1787,6 +1788,11 @@ func (s *ClientService) bulkSetEnableInboundClients(inboundSvc *InboundService, 
 		}
 		if err := s.SyncInbound(tx, inboundId, finalClients); err != nil {
 			return err
+		}
+		if enable {
+			if err := inboundSvc.validateCommittedBandwidthInboundClients(tx, inboundId); err != nil {
+				return err
+			}
 		}
 		if oldInbound.NodeID != nil {
 			return (&NodeService{}).MarkNodeDirtyTx(tx, *oldInbound.NodeID)

@@ -3,9 +3,15 @@ package xray
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +26,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
+	"github.com/mhsanaei/3x-ui/v3/internal/xraybandwidthchild/launch"
+	"github.com/xtls/xray-core/core"
 )
 
 // GetBinaryName returns the Xray binary filename for the current OS and architecture.
@@ -115,6 +123,32 @@ func NewProcess(xrayConfig *Config) *Process {
 	return p
 }
 
+// NewProcessWithBandwidth creates a process that runs the panel's embedded Xray core.
+// The private launch parameters are snapshotted for delivery over the child's stdin.
+func NewProcessWithBandwidth(xrayConfig *Config, handshake launch.Handshake) (*Process, error) {
+	handshake.Ready = nil
+	handshake.ConfigSHA256 = nil
+	handshake.Generated = nil
+	if xrayConfig != nil {
+		for _, inbound := range xrayConfig.InboundConfigs {
+			if _, bound := handshake.Clients[inbound.Tag]; bound && inbound.PanelGenerated && inbound.BandwidthAutomatic {
+				if handshake.Generated == nil {
+					handshake.Generated = make(map[string]bool)
+				}
+				handshake.Generated[inbound.Tag] = true
+			}
+		}
+	}
+	payload, err := encodeBandwidthHandshake(handshake)
+	if err != nil {
+		return nil, err
+	}
+	p := NewProcess(xrayConfig)
+	p.bandwidthHandshake = payload
+	p.version = core.Version()
+	return p, nil
+}
+
 // NewTestProcess creates a new Xray process that uses a specific config file path.
 // Used for test runs (e.g. outbound test) so the main config.json is not overwritten.
 // The config file at configPath is removed when the process is stopped.
@@ -189,6 +223,10 @@ type process struct {
 	// lazily by the first caller.
 	onlineAPISupport atomic.Int32
 
+	// bandwidthHandshake is immutable after construction. A nil value selects the stock binary.
+	bandwidthHandshake []byte
+	bandwidthStartMu   sync.Mutex
+
 	config     *Config
 	configPath string // if set, use this path instead of GetConfigPath() and remove on Stop
 	logWriter  *LogWriter
@@ -222,14 +260,34 @@ func (p *process) SetOnlineAPISupport(v OnlineAPISupport) {
 }
 
 var (
-	xrayGracefulStopTimeout = 5 * time.Second
-	xrayForceStopTimeout    = 2 * time.Second
-	xrayVersionTimeout      = 5 * time.Second
-	// OnCrash is called when xray crashes unexpectedly. Set from web layer.
-	OnCrash func(err error)
+	xrayGracefulStopTimeout   = 5 * time.Second
+	xrayForceStopTimeout      = 2 * time.Second
+	xrayVersionTimeout        = 5 * time.Second
+	xrayBandwidthReadyTimeout = 15 * time.Second
 	// ErrXrayNotRunning reports an operation that requires a running core when xray is stopped.
 	ErrXrayNotRunning = errors.New("xray is not running")
 )
+
+var crashHandler struct {
+	sync.RWMutex
+	callback func(error)
+}
+
+// SetCrashHandler replaces the callback for unexpected Xray exits.
+func SetCrashHandler(callback func(error)) {
+	crashHandler.Lock()
+	crashHandler.callback = callback
+	crashHandler.Unlock()
+}
+
+func reportCrash(err error) {
+	crashHandler.RLock()
+	callback := crashHandler.callback
+	crashHandler.RUnlock()
+	if callback != nil {
+		callback(err)
+	}
+}
 
 // newProcess creates a new internal process struct for Xray.
 func newProcess(config *Config) *process {
@@ -325,7 +383,7 @@ func (p *Process) SetConfig(config *Config) {
 // keeping it in step after a hot apply (Start only writes it on a cold start).
 func (p *Process) PersistConfig() error {
 	p.mu.RLock()
-	data, err := json.MarshalIndent(p.config, "", "  ")
+	data, err := p.marshalConfig()
 	path := p.configPath
 	p.mu.RUnlock()
 	if err != nil {
@@ -611,8 +669,12 @@ func (p *process) refreshVersion() {
 	p.mu.Unlock()
 }
 
-// Start launches the Xray process with the current configuration.
+// Start launches Xray with the current configuration. Managed mode waits for core readiness.
 func (p *process) Start() (err error) {
+	if p.bandwidthHandshake != nil {
+		p.bandwidthStartMu.Lock()
+		defer p.bandwidthStartMu.Unlock()
+	}
 	if p.IsRunning() {
 		return errors.New("xray is already running")
 	}
@@ -624,7 +686,7 @@ func (p *process) Start() (err error) {
 		}
 	}()
 
-	data, err := json.MarshalIndent(p.config, "", "  ")
+	data, err := p.marshalConfig()
 	if err != nil {
 		return common.NewErrorf("Failed to generate XRAY configuration files: %v", err)
 	}
@@ -643,7 +705,19 @@ func (p *process) Start() (err error) {
 		return common.NewErrorf("Failed to write configuration file: %v", err)
 	}
 
-	cmd := exec.CommandContext(context.Background(), GetBinaryPath(), "-c", configPath)
+	var listener *net.TCPListener
+	var ready *launch.Ready
+	if p.bandwidthHandshake != nil {
+		listener, ready, err = newBandwidthReadiness()
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+	}
+	cmd, err := p.command(configPath, ready, data)
+	if err != nil {
+		return err
+	}
 	cmd.Stdout = p.logWriter
 	cmd.Stderr = p.logWriter
 
@@ -652,10 +726,148 @@ func (p *process) Start() (err error) {
 		return err
 	}
 
-	p.refreshVersion()
+	if ready == nil {
+		p.refreshVersion()
+	} else {
+		p.mu.RLock()
+		done := p.done
+		p.mu.RUnlock()
+		if err := waitBandwidthReady(listener, ready.Nonce, done, xrayBandwidthReadyTimeout); err != nil {
+			childErr := p.GetErr()
+			stopErr := p.Stop()
+			if errors.Is(stopErr, ErrXrayNotRunning) {
+				stopErr = nil
+			}
+			return errors.Join(err, childErr, stopErr)
+		}
+	}
 	p.refreshAPIPort()
 
 	return nil
+}
+
+func (p *process) command(configPath string, ready *launch.Ready, data []byte) (*exec.Cmd, error) {
+	if p.bandwidthHandshake == nil {
+		return exec.CommandContext(context.Background(), GetBinaryPath(), "-c", configPath), nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve metered Xray executable: %w", err)
+	}
+	var handshake launch.Handshake
+	if err := jsonv2.Unmarshal(p.bandwidthHandshake, &handshake); err != nil {
+		return nil, errors.New("invalid metered Xray handshake snapshot")
+	}
+	handshake.Ready = ready
+	if data != nil {
+		digest := sha256.Sum256(data)
+		handshake.ConfigSHA256 = digest[:]
+	}
+	payload, err := encodeBandwidthHandshake(handshake)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(context.Background(), executable, launch.Command, configPath)
+	// os/exec closes the child's stdin pipe once it has copied this finite payload.
+	cmd.Stdin = bytes.NewReader(payload)
+	return cmd, nil
+}
+
+func (p *process) marshalConfig() ([]byte, error) {
+	if p.bandwidthHandshake == nil || p.config == nil {
+		return json.MarshalIndent(p.config, "", "  ")
+	}
+	config := *p.config
+	config.InboundConfigs = make([]InboundConfig, 0, len(p.config.InboundConfigs))
+	for _, inbound := range p.config.InboundConfigs {
+		if !inbound.IsSidecarRelay() {
+			config.InboundConfigs = append(config.InboundConfigs, inbound)
+		}
+	}
+	// Managed relay handlers and credentials arrive over the private child
+	// stdin pipe. A stock core loading this file gets no sidecar listeners.
+	return json.MarshalIndent(&config, "", "  ")
+}
+
+func encodeBandwidthHandshake(handshake launch.Handshake) ([]byte, error) {
+	payload, err := jsonv2.Marshal(handshake)
+	if err != nil {
+		return nil, errors.New("invalid metered Xray handshake")
+	}
+	if len(payload) > launch.MaxHandshakeSize {
+		return nil, errors.New("metered Xray handshake exceeds size limit")
+	}
+	return payload, nil
+}
+
+func newBandwidthReadiness() (*net.TCPListener, *launch.Ready, error) {
+	nonce := make([]byte, launch.ReadyNonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, nil, fmt.Errorf("create metered Xray readiness challenge: %w", err)
+	}
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen for metered Xray readiness: %w", err)
+	}
+	return listener, &launch.Ready{Address: listener.Addr().String(), Nonce: nonce}, nil
+}
+
+func waitBandwidthReady(listener *net.TCPListener, nonce []byte, childDone <-chan struct{}, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	readerDone := make(chan struct{})
+	var readErr error
+	go func() {
+		defer close(readerDone)
+		readErr = receiveBandwidthReady(ctx, listener, nonce)
+	}()
+	defer func() {
+		cancel()
+		_ = listener.Close()
+		<-readerDone
+	}()
+
+	exited := errors.New("metered Xray exited before reporting readiness")
+	timedOut := errors.New("timed out waiting for metered Xray readiness")
+	select {
+	case <-childDone:
+		return exited
+	case <-ctx.Done():
+		return timedOut
+	case <-readerDone:
+		// Process exit and the deadline take precedence over a queued reply.
+		select {
+		case <-childDone:
+			return exited
+		default:
+		}
+		if ctx.Err() != nil {
+			return timedOut
+		}
+		return readErr
+	}
+}
+
+func receiveBandwidthReady(ctx context.Context, listener *net.TCPListener, nonce []byte) error {
+	for ctx.Err() == nil {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			return errors.New("could not receive metered Xray readiness signal")
+		}
+		// An unrelated local connection cannot occupy the listener indefinitely.
+		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		var frame [launch.ReadyNonceSize + 1]byte
+		n, readErr := io.ReadFull(conn, frame[:])
+		stop()
+		_ = conn.Close()
+		if readErr == io.ErrUnexpectedEOF && n == launch.ReadyNonceSize && subtle.ConstantTimeCompare(frame[:n], nonce) == 1 {
+			return nil
+		}
+	}
+	return ctx.Err()
 }
 
 // writeFileAtomic writes data to path via a same-directory temp file that is
@@ -755,9 +967,7 @@ func (p *process) waitForCommand(cmd *exec.Cmd, done chan struct{}) {
 
 	logger.Error("Failure in running xray-core:", err)
 	p.setExitErr(err)
-	if OnCrash != nil {
-		OnCrash(err)
-	}
+	reportCrash(err)
 }
 
 // Stop terminates the running Xray process.

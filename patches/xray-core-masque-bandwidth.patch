@@ -1,0 +1,657 @@
+diff --git a/proxy/masque/packet_gate.go b/proxy/masque/packet_gate.go
+new file mode 100644
+index 0000000..26da152
+--- /dev/null
++++ b/proxy/masque/packet_gate.go
+@@ -0,0 +1,52 @@
++package masque
++
++import "context"
++
++// packetGate is supplied by a dispatcher that meters authenticated CONNECT-IP
++// packets at the tunnel boundary.
++type packetGate interface {
++	VanillaProxyWaitMASQUEPacket(context.Context, int) error
++	// A managed identity returns a marked child context. An unmanaged identity
++	// returns the exact input. An invalid managed identity returns an error.
++	VanillaProxyMarkMASQUEFlow(context.Context) (context.Context, error)
++}
++
++// VanillaProxyPacketGateV1 identifies this revision of the packet boundary.
++func (*Server) VanillaProxyPacketGateV1() {}
++
++// VanillaProxyPacketGateEnabled reports whether this server has a packet gate.
++func (s *Server) VanillaProxyPacketGateEnabled() bool { return s.packetGate != nil }
++
++func (t *serverTunnel) enablePacketGate(ctx context.Context, requestDone, connectionDone <-chan struct{}, gate packetGate) {
++	t.gate = gate
++	t.gateCtx, t.cancelGate = context.WithCancel(ctx)
++	go func() {
++		select {
++		case <-requestDone:
++		case <-connectionDone:
++		case <-t.gateCtx.Done():
++		}
++		t.cancelGate()
++		// Unblock Read if the downlink stopped on an admission error.
++		t.conn.Close()
++	}()
++}
++
++func (t *serverTunnel) stopPacketGate() {
++	if t.cancelGate != nil {
++		t.cancelGate()
++	}
++}
++
++func (t *serverTunnel) waitPacket(n int) error {
++	if t.gate == nil {
++		return nil
++	}
++	if err := t.gateCtx.Err(); err != nil {
++		return err
++	}
++	if err := t.gate.VanillaProxyWaitMASQUEPacket(t.gateCtx, n); err != nil {
++		return err
++	}
++	return t.gateCtx.Err()
++}
+diff --git a/proxy/masque/packet_gate_test.go b/proxy/masque/packet_gate_test.go
+new file mode 100644
+index 0000000..481120a
+--- /dev/null
++++ b/proxy/masque/packet_gate_test.go
+@@ -0,0 +1,197 @@
++package masque
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/transport"
++)
++
++type packetGateFunc func(context.Context, int) error
++
++func (f packetGateFunc) VanillaProxyWaitMASQUEPacket(ctx context.Context, n int) error {
++	return f(ctx, n)
++}
++
++func (packetGateFunc) VanillaProxyMarkMASQUEFlow(ctx context.Context) (context.Context, error) {
++	return ctx, nil
++}
++
++func addMeteredTunnel(t *testing.T, s *Server, email string, reqDone, connDone <-chan struct{}) (*serverTunnel, *fakeTunnelConn) {
++	t.Helper()
++	user := &protocol.MemoryUser{Email: email, Account: &MemoryAccount{Password: "test"}}
++	conn := newFakeTunnelConn()
++	tunnel := newServerTunnel(conn, user)
++	tunnel.dev = &fakeDevice{reads: make(chan []byte, 16)}
++	for _, pool := range s.pools {
++		addr, ok := pool.allocate()
++		require.True(t, ok)
++		tunnel.addrs = append(tunnel.addrs, addr)
++	}
++	ctx := session.ContextWithInbound(t.Context(), &session.Inbound{Name: "masque", Tag: "test", User: user})
++	tunnel.enablePacketGate(ctx, reqDone, connDone, s.packetGate)
++	require.True(t, s.register(tunnel))
++	s.startTunnel(tunnel)
++	t.Cleanup(tunnel.close)
++	return tunnel, conn
++}
++
++func await[T any](t *testing.T, values <-chan T) T {
++	t.Helper()
++	select {
++	case value := <-values:
++		return value
++	case <-time.After(time.Second):
++		t.Fatal("timeout waiting for packet gate")
++		var zero T
++		return zero
++	}
++}
++
++func TestPacketGateMetersPrivateStackBeforePublication(t *testing.T) {
++	type charge struct {
++		email string
++		bytes int
++	}
++	charges := make(chan charge)
++	grants := make(chan struct{})
++	s, shared := newTestServer(t)
++	s.packetGate = packetGateFunc(func(ctx context.Context, n int) error {
++		select {
++		case charges <- charge{session.InboundFromContext(ctx).User.Email, n}:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++		select {
++		case <-grants:
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	})
++	require.True(t, s.VanillaProxyPacketGateEnabled())
++	a, aConn := addMeteredTunnel(t, s, "alice", nil, nil)
++	_, bConn := addMeteredTunnel(t, s, "bob", nil, nil)
++	dev := a.dev.(*fakeDevice)
++	go s.readFromTunnel(a)
++	require.NoError(t, s.Start())
++	t.Cleanup(func() { _ = s.Close() })
++
++	// Neither an unassigned pool address nor another tenant is reachable.
++	aConn.reads <- ipPacket("10.14.0.2", "10.14.0.9")
++	aConn.reads <- ipPacket("10.14.0.2", "10.14.0.3")
++
++	toStack := ipPacket("fd14::2", "2001:db8::1")
++	aConn.reads <- toStack
++	require.Equal(t, charge{"alice", len(toStack)}, await(t, charges))
++	require.Empty(t, dev.packets())
++	grants <- struct{}{}
++	require.Eventually(t, func() bool { return len(dev.packets()) == 1 }, time.Second, time.Millisecond)
++	require.Equal(t, [][]byte{toStack}, dev.packets())
++	require.Empty(t, bConn.packets())
++	require.Empty(t, shared.packets())
++
++	// A private stack cannot send to the address assigned to another tunnel.
++	dev.reads <- ipPacket("2001:db8::1", "fd14::3")
++	fromStack := ipPacket("2001:db8::1", "fd14::2")
++	dev.reads <- fromStack
++	require.Equal(t, charge{"alice", len(fromStack)}, await(t, charges))
++	require.Empty(t, aConn.packets())
++	grants <- struct{}{}
++	require.Eventually(t, func() bool { return len(aConn.packets()) == 1 }, time.Second, time.Millisecond)
++	require.Equal(t, [][]byte{fromStack}, aConn.packets())
++}
++
++func TestPacketGateStopsWaitingOnRequestOrConnectionEnd(t *testing.T) {
++	for _, end := range []string{"request", "connection", "server", "user"} {
++		t.Run(end, func(t *testing.T) {
++			s, _ := newTestServer(t)
++			s.validator = newValidator()
++			requestDone, connDone := make(chan struct{}), make(chan struct{})
++			waiting, canceled := make(chan struct{}), make(chan error, 1)
++			s.packetGate = packetGateFunc(func(ctx context.Context, _ int) error {
++				close(waiting)
++				<-ctx.Done()
++				canceled <- ctx.Err()
++				return ctx.Err()
++			})
++			tunnel, conn := addMeteredTunnel(t, s, "alice", requestDone, connDone)
++			require.NoError(t, s.validator.add(tunnel.user))
++			require.NoError(t, s.Start())
++			t.Cleanup(func() { _ = s.Close() })
++			packet := ipPacket("192.0.2.1", "10.14.0.2")
++			require.Equal(t, tunnel, s.lookup(netip.MustParseAddr("10.14.0.2")))
++			tunnel.dev.(*fakeDevice).reads <- packet
++			await(t, waiting)
++			switch end {
++			case "request":
++				close(requestDone)
++			case "connection":
++				close(connDone)
++			case "server":
++				require.NoError(t, s.Close())
++			case "user":
++				require.NoError(t, s.RemoveUser(t.Context(), "alice"))
++			}
++			require.ErrorIs(t, await(t, canceled), context.Canceled)
++			require.Eventually(t, conn.isClosed, time.Second, time.Millisecond)
++			require.Empty(t, conn.packets())
++		})
++	}
++}
++
++type gateTestDispatcher struct {
++	routing.Dispatcher
++	emails []string
++}
++
++func (d *gateTestDispatcher) DispatchLink(ctx context.Context, _ net.Destination, _ *transport.Link) error {
++	d.emails = append(d.emails, session.InboundFromContext(ctx).User.Email)
++	return nil
++}
++
++type reuseStackConn struct{ stackConn }
++
++func (*reuseStackConn) RemoteAddr() net.Addr {
++	return &net.TCPAddr{IP: net.IP{10, 14, 0, 2}, Port: 1234}
++}
++
++func TestPacketGateKeepsOldStackBoundAfterAddressReuse(t *testing.T) {
++	s, _ := newTestServer(t)
++	s.ctx = t.Context()
++	dispatcher := &gateTestDispatcher{}
++	s.dispatcher = dispatcher
++	s.packetGate = packetGateFunc(func(context.Context, int) error { return nil })
++	pool, err := newAddressPool(netip.MustParsePrefix("10.14.0.1/30"))
++	require.NoError(t, err)
++	s.pools = []*addressPool{pool}
++	alice, _ := addMeteredTunnel(t, s, "alice", nil, nil)
++	old := tunnelConnectionHandler{server: s, tunnel: alice}
++	dest := net.TCPDestination(net.ParseAddress("192.0.2.1"), 443)
++	old.HandleConnection(&reuseStackConn{}, dest)
++	require.Equal(t, []string{"alice"}, dispatcher.emails)
++
++	s.release(alice)
++	await(t, alice.stackDone)
++	await(t, alice.writerDone)
++	bob, bobConn := addMeteredTunnel(t, s, "bob", nil, nil)
++	require.Equal(t, alice.addrs, bob.addrs)
++
++	late := &reuseStackConn{}
++	old.HandleConnection(late, dest)
++	require.EqualValues(t, 1, late.closed.Load())
++	s.HandleConnection(&reuseStackConn{}, dest)
++	require.Equal(t, []string{"alice"}, dispatcher.emails)
++	require.Empty(t, bobConn.packets())
++
++	newHandler := tunnelConnectionHandler{server: s, tunnel: bob}
++	newHandler.HandleConnection(&reuseStackConn{}, dest)
++	require.Equal(t, []string{"alice", "bob"}, dispatcher.emails)
++}
+diff --git a/proxy/masque/server.go b/proxy/masque/server.go
+index db8660d..8647ae3 100644
+--- a/proxy/masque/server.go
++++ b/proxy/masque/server.go
+@@ -40,6 +40,7 @@ const (
+ type Server struct {
+ 	validator  *validator
+ 	dispatcher routing.Dispatcher
++	packetGate packetGate
+ 	ctx        context.Context
+ 	tag        string
+ 	sniffing   session.SniffingRequest
+@@ -63,6 +64,13 @@ type serverTunnel struct {
+ 	queue  chan *buf.Buffer
+ 	done   chan struct{}
+ 
++	gate       packetGate
++	gateCtx    context.Context
++	cancelGate context.CancelFunc
++	dev        tun.Device
++	stackDone  chan struct{}
++	writerDone chan struct{}
++
+ 	mu    sync.Mutex
+ 	conns map[net.Conn]struct{}
+ }
+@@ -78,10 +86,10 @@ func newServerTunnel(conn stat.Connection, user *protocol.MemoryUser) *serverTun
+ }
+ 
+ func (t *serverTunnel) send(b *buf.Buffer) bool {
+-	select {
+-	case <-t.done:
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.conns == nil || t.gateCtx != nil && t.gateCtx.Err() != nil {
+ 		return false
+-	default:
+ 	}
+ 	select {
+ 	case t.queue <- b:
+@@ -94,7 +102,7 @@ func (t *serverTunnel) send(b *buf.Buffer) bool {
+ func (t *serverTunnel) track(conn net.Conn) bool {
+ 	t.mu.Lock()
+ 	defer t.mu.Unlock()
+-	if t.conns == nil {
++	if t.conns == nil || t.gateCtx != nil && t.gateCtx.Err() != nil {
+ 		return false
+ 	}
+ 	t.conns[conn] = struct{}{}
+@@ -108,6 +116,7 @@ func (t *serverTunnel) untrack(conn net.Conn) {
+ }
+ 
+ func (t *serverTunnel) close() {
++	t.stopPacketGate()
+ 	t.mu.Lock()
+ 	conns := t.conns
+ 	if conns != nil {
+@@ -118,6 +127,22 @@ func (t *serverTunnel) close() {
+ 	for conn := range conns {
+ 		conn.Close()
+ 	}
++	if t.dev != nil {
++		t.conn.Close()
++		t.dev.Close()
++		if t.stackDone != nil {
++			<-t.stackDone
++			<-t.writerDone
++		}
++	}
++	for {
++		select {
++		case packet := <-t.queue:
++			packet.Release()
++		default:
++			return
++		}
++	}
+ }
+ 
+ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+@@ -176,6 +201,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+ 		local:      local,
+ 		tunnels:    make(map[netip.Addr]*serverTunnel),
+ 	}
++	s.packetGate, _ = s.dispatcher.(packetGate)
+ 	if inbound := session.InboundFromContext(ctx); inbound != nil {
+ 		s.tag = inbound.Tag
+ 	}
+@@ -197,7 +223,7 @@ func (s *Server) Start() error {
+ 		return nil
+ 	}
+ 	s.started = true
+-	go s.readFromStack()
++	go s.readFromStack(nil)
+ 	return nil
+ }
+ 
+@@ -215,6 +241,9 @@ func (s *Server) Close() error {
+ 		}
+ 	}
+ 	s.mu.Unlock()
++	for _, t := range tunnels {
++		t.stopPacketGate()
++	}
+ 	for _, t := range tunnels {
+ 		t.conn.Close()
+ 	}
+@@ -231,15 +260,18 @@ func (s *Server) RemoveUser(ctx context.Context, email string) error {
+ 		return err
+ 	}
+ 	s.mu.RLock()
+-	var conns []stat.Connection
++	var tunnels []*serverTunnel
+ 	for _, t := range s.tunnels {
+-		if t.user == user && !slices.Contains(conns, t.conn) {
+-			conns = append(conns, t.conn)
++		if t.user == user && !slices.Contains(tunnels, t) {
++			tunnels = append(tunnels, t)
+ 		}
+ 	}
+ 	s.mu.RUnlock()
+-	for _, conn := range conns {
+-		conn.Close()
++	for _, t := range tunnels {
++		t.stopPacketGate()
++	}
++	for _, t := range tunnels {
++		t.conn.Close()
+ 	}
+ 	return nil
+ }
+@@ -283,6 +315,20 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
+ 	}
+ 	inbound.User = user
+ 
++	var gateCtx context.Context
++	if s.packetGate != nil {
++		identity := *inbound
++		authenticated := session.ContextWithInbound(ctx, &identity)
++		marked, err := s.packetGate.VanillaProxyMarkMASQUEFlow(authenticated)
++		if err != nil {
++			sconn.Reject(http.StatusForbidden, nil)
++			return errors.New("MASQUE: packet gate rejected tunnel").Base(err)
++		}
++		if marked != authenticated {
++			gateCtx = authenticated
++		}
++	}
++
+ 	t := newServerTunnel(conn, user)
+ 	for _, pool := range s.pools {
+ 		if addr, ok := pool.allocate(); ok {
+@@ -295,18 +341,30 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
+ 		return errors.New("MASQUE: no address left to assign")
+ 	}
+ 
++	if gateCtx != nil {
++		dev, _, err := wireguard.CreateNetTUN(s.local, nil, s.mtu, tunnelConnectionHandler{server: s, tunnel: t})
++		if err != nil {
++			sconn.Reject(http.StatusServiceUnavailable, nil)
++			return errors.New("MASQUE: failed to create tunnel stack").Base(err)
++		}
++		t.dev = dev
++	}
++
+ 	ipConn, err := sconn.Accept()
+ 	if err != nil {
+ 		return errors.New("MASQUE: failed to accept the tunnel").Base(err)
+ 	}
+ 	t.ipConn = ipConn
++	if gateCtx != nil {
++		t.enablePacketGate(gateCtx, sconn.Request().Context().Done(), ipConn.Done(), s.packetGate)
++	}
+ 	if !s.register(t) {
+ 		return errors.New("MASQUE: server closed")
+ 	}
+ 	if !s.validator.contains(user) {
+ 		return errors.New("MASQUE: user ", name, " was removed")
+ 	}
+-	go s.writeToTunnel(t)
++	s.startTunnel(t)
+ 
+ 	prefixes := make([]netip.Prefix, len(t.addrs))
+ 	for i, addr := range t.addrs {
+@@ -383,6 +441,7 @@ func (s *Server) register(t *serverTunnel) bool {
+ }
+ 
+ func (s *Server) release(t *serverTunnel) {
++	t.close()
+ 	s.mu.Lock()
+ 	for _, addr := range t.addrs {
+ 		if s.tunnels[addr] == t {
+@@ -390,7 +449,6 @@ func (s *Server) release(t *serverTunnel) {
+ 		}
+ 	}
+ 	s.mu.Unlock()
+-	t.close()
+ 	for _, addr := range t.addrs {
+ 		for _, pool := range s.pools {
+ 			if pool.prefix.Contains(addr) {
+@@ -412,6 +470,10 @@ func (s *Server) inPool(addr netip.Addr) bool {
+ 
+ func (s *Server) readFromTunnel(t *serverTunnel) error {
+ 	b := make([]byte, 1<<16)
++	dev := s.dev
++	if t.dev != nil {
++		dev = t.dev
++	}
+ 	for {
+ 		n, err := t.conn.Read(b)
+ 		if err != nil {
+@@ -427,24 +489,49 @@ func (s *Server) readFromTunnel(t *serverTunnel) error {
+ 		if !ok || dst.IsLinkLocalUnicast() || dst.IsMulticast() {
+ 			continue
+ 		}
+-		if other := s.lookup(dst); other != nil {
+-			if other != t {
+-				packet := buf.NewWithSize(int32(n))
+-				packet.Write(b[:n])
+-				if !other.send(packet) {
+-					packet.Release()
++		if t.dev == nil {
++			if other := s.lookup(dst); other != nil {
++				if other != t && other.dev == nil {
++					packet := buf.NewWithSize(int32(n))
++					packet.Write(b[:n])
++					if !other.send(packet) {
++						packet.Release()
++					}
+ 				}
++				continue
+ 			}
+-			continue
+ 		}
+ 		if s.inPool(dst) && !slices.Contains(s.local, dst) {
+ 			continue
+ 		}
+-		s.dev.Write([][]byte{b[:n]}, 0)
++		if err := t.waitPacket(n); err != nil {
++			return err
++		}
++		dev.Write([][]byte{b[:n]}, 0)
+ 	}
+ }
+ 
+-func (s *Server) readFromStack() {
++func (s *Server) startTunnel(t *serverTunnel) {
++	if t.dev == nil {
++		go s.writeToTunnel(t)
++		return
++	}
++	t.stackDone, t.writerDone = make(chan struct{}), make(chan struct{})
++	go func() {
++		defer close(t.stackDone)
++		s.readFromStack(t)
++	}()
++	go func() {
++		defer close(t.writerDone)
++		s.writeToTunnel(t)
++	}()
++}
++
++func (s *Server) readFromStack(owner *serverTunnel) {
++	dev := s.dev
++	if owner != nil {
++		dev = owner.dev
++	}
+ 	sizes := []int{0}
+ 	var b *buf.Buffer
+ 	for {
+@@ -452,7 +539,7 @@ func (s *Server) readFromStack() {
+ 			b = buf.NewWithSize(int32(s.mtu))
+ 		}
+ 		b.Clear()
+-		if _, err := s.dev.Read([][]byte{b.Extend(int32(s.mtu))}, sizes, 0); err != nil {
++		if _, err := dev.Read([][]byte{b.Extend(int32(s.mtu))}, sizes, 0); err != nil {
+ 			b.Release()
+ 			return
+ 		}
+@@ -461,20 +548,34 @@ func (s *Server) readFromStack() {
+ 		if !ok {
+ 			continue
+ 		}
+-		if t := s.lookup(dst); t != nil && t.send(b) {
++		// The private stack's output belongs only to its original tunnel.
++		if owner != nil {
++			if slices.Contains(owner.addrs, dst) && owner.send(b) {
++				b = nil
++			}
++		} else if t := s.lookup(dst); t != nil && t.dev == nil && t.send(b) {
+ 			b = nil
+ 		}
+ 	}
+ }
+ 
+ func (s *Server) writeToTunnel(t *serverTunnel) {
++	dev := s.dev
++	if t.dev != nil {
++		dev = t.dev
++	}
+ 	for {
+ 		select {
+ 		case b := <-t.queue:
++			if err := t.waitPacket(int(b.Len())); err != nil {
++				b.Release()
++				t.stopPacketGate()
++				return
++			}
+ 			_, err := t.conn.Write(b.Bytes())
+ 			b.Release()
+ 			if ptb, ok := go_errors.AsType[*masque.PacketTooBigError](err); ok {
+-				s.dev.Write([][]byte{ptb.ICMP}, 0)
++				dev.Write([][]byte{ptb.ICMP}, 0)
+ 			}
+ 		case <-t.done:
+ 			return
+@@ -501,18 +602,48 @@ func packetDestination(packet []byte) (netip.Addr, bool) {
+ 
+ // HandleConnection implements tun.ConnectionHandler
+ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
+-	defer conn.Close()
+ 	source := net.DestinationFromAddr(conn.RemoteAddr())
+ 	addr, _ := netip.AddrFromSlice(source.Address.IP())
+ 	t := s.lookup(addr.Unmap())
+-	if t == nil || !t.track(conn) {
++	if t == nil || t.dev != nil {
+ 		errors.LogInfo(s.ctx, "MASQUE: no tunnel for ", source, " to ", dest)
++		conn.Close()
++		return
++	}
++	s.handleTunnelConnection(t, conn, source, dest)
++}
++
++type tunnelConnectionHandler struct {
++	server *Server
++	tunnel *serverTunnel
++}
++
++func (h tunnelConnectionHandler) HandleConnection(conn net.Conn, dest net.Destination) {
++	source := net.DestinationFromAddr(conn.RemoteAddr())
++	addr, _ := netip.AddrFromSlice(source.Address.IP())
++	if !slices.Contains(h.tunnel.addrs, addr.Unmap()) {
++		conn.Close()
++		return
++	}
++	h.server.handleTunnelConnection(h.tunnel, conn, source, dest)
++}
++
++func (s *Server) handleTunnelConnection(t *serverTunnel, conn net.Conn, source, dest net.Destination) {
++	defer conn.Close()
++	if !t.track(conn) {
+ 		return
+ 	}
+ 	defer t.untrack(conn)
+ 
+ 	ctx, cancel := context.WithCancel(s.ctx)
+ 	defer cancel()
++	if t.gateCtx != nil {
++		stop := context.AfterFunc(t.gateCtx, cancel)
++		defer stop()
++		if t.gateCtx.Err() != nil {
++			return
++		}
++	}
+ 	ctx = c.ContextWithID(ctx, session.NewID())
+ 	inbound := session.Inbound{
+ 		Name:          "masque",
+@@ -532,6 +663,14 @@ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
+ 		Status: log.AccessAccepted,
+ 		Email:  t.user.Email,
+ 	})
++	if t.gate != nil {
++		var err error
++		ctx, err = t.gate.VanillaProxyMarkMASQUEFlow(ctx)
++		if err != nil {
++			errors.LogError(ctx, errors.New("MASQUE: packet gate rejected flow").Base(err))
++			return
++		}
++	}
+ 	errors.LogInfo(ctx, "processing from ", source, " to ", dest)
+ 
+ 	writer := buf.NewWriter(conn)
+diff --git a/transport/internet/masque/connectip/conn.go b/transport/internet/masque/connectip/conn.go
+index f4d03a7..246828e 100644
+--- a/transport/internet/masque/connectip/conn.go
++++ b/transport/internet/masque/connectip/conn.go
+@@ -703,6 +703,9 @@ func (c *Conn) MaxPacketSize() int {
+ 	return max(0, int(tooLarge.MaxDatagramPayloadSize)-c.datagramOverhead())
+ }
+ 
++// Done closes when the CONNECT-IP stream terminates, including remote closure.
++func (c *Conn) Done() <-chan struct{} { return c.closeChan }
++
+ func (c *Conn) Close() error {
+ 	c.closeOnce.Do(func() {
+ 		c.mu.Lock()

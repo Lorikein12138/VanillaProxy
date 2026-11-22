@@ -351,7 +351,8 @@ type InboundOption struct {
 	TuicServer *tuic.TuicServerSettings  `json:"tuicServer,omitempty"`
 	// Hosting node; nil for this panel's own inbounds. Lets the clients
 	// page map a node filter onto inbound IDs (#4997).
-	NodeId *int `json:"nodeId,omitempty"`
+	NodeId           *int   `json:"nodeId,omitempty"`
+	BandwidthNodeKey string `json:"bandwidthNodeKey"`
 	// Share-host resolution inputs, mirroring the subscription's
 	// resolveInboundAddress so the clients page renders a node-managed WireGuard
 	// Endpoint that points at the node, not the master panel. NodeAddress is the
@@ -367,23 +368,23 @@ type InboundOption struct {
 func (s *InboundService) GetInboundOptions(userId int) ([]InboundOption, error) {
 	db := database.GetDB()
 	var rows []struct {
-		Id                int    `gorm:"column:id"`
-		Remark            string `gorm:"column:remark"`
-		Tag               string `gorm:"column:tag"`
-		Protocol          string `gorm:"column:protocol"`
-		Port              int    `gorm:"column:port"`
-		Enable            bool   `gorm:"column:enable"`
-		StreamSettings    string `gorm:"column:stream_settings"`
-		Settings          string `gorm:"column:settings"`
-		Listen            string `gorm:"column:listen"`
-		ShareAddr         string `gorm:"column:share_addr"`
-		ShareAddrStrategy string `gorm:"column:share_addr_strategy"`
-		NodeId            *int   `gorm:"column:node_id"`
-		NodeAddress       string `gorm:"column:node_address"`
-		DisableFlow       bool   `gorm:"column:disable_flow"`
+		Id                int                  `gorm:"column:id"`
+		Remark            string               `gorm:"column:remark"`
+		Tag               string               `gorm:"column:tag"`
+		Protocol          string               `gorm:"column:protocol"`
+		Port              int                  `gorm:"column:port"`
+		Enable            bool                 `gorm:"column:enable"`
+		StreamSettings    string               `gorm:"column:stream_settings"`
+		Settings          string               `gorm:"column:settings"`
+		Listen            string               `gorm:"column:listen"`
+		ShareAddr         string               `gorm:"column:share_addr"`
+		ShareAddrStrategy string               `gorm:"column:share_addr_strategy"`
+		BandwidthNode     bandwidthInboundNode `gorm:"embedded"`
+		NodeAddress       string               `gorm:"column:node_address"`
+		DisableFlow       bool                 `gorm:"column:disable_flow"`
 	}
 	err := db.Table("inbounds").
-		Select("inbounds.id, inbounds.remark, inbounds.tag, inbounds.protocol, inbounds.port, inbounds.enable, inbounds.stream_settings, inbounds.settings, inbounds.listen, inbounds.share_addr, inbounds.share_addr_strategy, inbounds.node_id, COALESCE(nodes.address, '') AS node_address, inbounds.disable_flow").
+		Select("inbounds.id, inbounds.remark, inbounds.tag, inbounds.protocol, inbounds.port, inbounds.enable, inbounds.stream_settings, inbounds.settings, inbounds.listen, inbounds.share_addr, inbounds.share_addr_strategy, COALESCE(nodes.address, '') AS node_address, inbounds.disable_flow, "+bandwidthInboundNodeColumns).
 		Joins("LEFT JOIN nodes ON nodes.id = inbounds.node_id").
 		Where("inbounds.user_id = ?", userId).
 		Order("inbounds.id ASC").
@@ -416,7 +417,8 @@ func (s *InboundService) GetInboundOptions(userId int) ([]InboundOption, error) 
 			MtprotoDomain:     inboundMtprotoDomain(r.Protocol, r.Settings),
 			AwgServer:         inboundAmneziaWGServer(r.Protocol, r.Settings),
 			TuicServer:        inboundTuicServer(r.Protocol, r.Settings),
-			NodeId:            r.NodeId,
+			NodeId:            r.BandwidthNode.NodeId,
+			BandwidthNodeKey:  r.BandwidthNode.bandwidthNodeKey(),
 			NodeAddress:       r.NodeAddress,
 			Listen:            r.Listen,
 			ShareAddr:         r.ShareAddr,
@@ -1277,7 +1279,13 @@ func (s *InboundService) normalizeMtprotoXrayPort(inbound *model.Inbound, oldSet
 // Returns the created inbound, whether Xray needs restart, and any error.
 func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
 	defer InvalidateSubData()
+	if s.FromNodeSync || inbound.NodeID != nil {
+		inbound.Settings, _ = model.StripInboundProxyBandwidthBindings(inbound.Protocol, inbound.Settings)
+	}
 	inbound.Id = 0
+	if err := validateSavedBandwidthInbound(inbound); err != nil {
+		return inbound, false, err
+	}
 	if err := normalizeTuicSettings(inbound); err != nil {
 		return inbound, false, err
 	}
@@ -1392,6 +1400,12 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 	// the inbound method (e.g. an API caller supplied a wrong-size key).
 	if normalized, changed := normalizeShadowsocksClientKeys(inbound.Settings); changed {
 		inbound.Settings = normalized
+		if activeBandwidthNode.Load() != nil && inbound.Enable && inbound.NodeID == nil {
+			clients, err = s.GetClients(inbound)
+			if err != nil {
+				return inbound, false, err
+			}
+		}
 	}
 
 	// Secure client ID
@@ -1533,6 +1547,9 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 		if err := s.clientService.SyncInbound(tx, inbound.Id, clients); err != nil {
 			return err
 		}
+		if err := s.validateSavedBandwidthXrayInbound(tx, inbound); err != nil {
+			return err
+		}
 		if _, err := database.CreateHostsFromExternalProxy(tx, inbound.Id, inbound.StreamSettings); err != nil {
 			return err
 		}
@@ -1661,6 +1678,9 @@ func (s *InboundService) delInbound(id int) (bool, func(), error) {
 
 	if err := runSerializedTx(func(tx *gorm.DB) error {
 		if err := s.clientService.DetachInbound(tx, id); err != nil {
+			return err
+		}
+		if err := deleteConfirmedProxyBindingForInbound(tx, id); err != nil {
 			return err
 		}
 		if err := tx.Delete(model.Inbound{}, id).Error; err != nil {
@@ -1836,27 +1856,24 @@ func (s *InboundService) SetInboundSubSortIndex(id int, index int) error {
 
 func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 	defer InvalidateSubData()
-	inbound, err := s.GetInbound(id)
-	if err != nil {
-		return false, err
-	}
-	if inbound.Enable == enable {
-		return false, nil
-	}
-
 	db := database.GetDB()
-	// Enabling puts this row's ports into the running config, and the guards ran
-	// only if it was saved: a restored or hand-edited row reaches it unchecked.
-	if enable && inbound.NodeID == nil {
-		conflict, err := checkPortConflictTx(db, inbound, inbound.Id)
+	inbound := &model.Inbound{}
+	checkPort := func(tx *gorm.DB) error {
+		// A restored or hand-edited disabled row may not have been checked
+		// against the currently enabled listen ports.
+		if !enable || inbound.NodeID != nil {
+			return nil
+		}
+		conflict, err := checkPortConflictTx(tx, inbound, inbound.Id)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if conflict != nil {
-			return false, common.NewError(conflict.String())
+			return common.NewError(conflict.String())
 		}
+		return nil
 	}
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	writeEnable := func(tx *gorm.DB) error {
 		if err := tx.Model(model.Inbound{}).Where("id = ?", id).
 			Update("enable", enable).Error; err != nil {
 			return err
@@ -1865,9 +1882,50 @@ func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 			return (&NodeService{}).MarkNodeDirtyTx(tx, *inbound.NodeID)
 		}
 		return nil
-	}); err != nil {
-		return false, err
 	}
+	if activeBandwidthNode.Load() != nil {
+		var changed bool
+		if err := runSerializedTx(func(tx *gorm.DB) error {
+			if err := tx.First(inbound, id).Error; err != nil {
+				return err
+			}
+			if inbound.Enable == enable {
+				return nil
+			}
+			candidate := *inbound
+			candidate.Enable = enable
+			if err := validateSavedBandwidthInbound(&candidate); err != nil {
+				return err
+			}
+			if err := s.validateSavedBandwidthXrayInbound(tx, &candidate); err != nil {
+				return err
+			}
+			if err := checkPort(tx); err != nil {
+				return err
+			}
+			changed = true
+			return writeEnable(tx)
+		}); err != nil {
+			return false, err
+		}
+		if !changed {
+			return false, nil
+		}
+	} else {
+		if err := db.First(inbound, id).Error; err != nil {
+			return false, err
+		}
+		if inbound.Enable == enable {
+			return false, nil
+		}
+		if err := checkPort(db); err != nil {
+			return false, err
+		}
+		if err := db.Transaction(writeEnable); err != nil {
+			return false, err
+		}
+	}
+
 	inbound.Enable = enable
 
 	needRestart := false
@@ -2024,19 +2082,12 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		}
 	}
 
-	// Capture the pre-edit protocol and routing state before oldInbound is
-	// overwritten with the new values further down, then ensure a routed
-	// inbound keeps a stable egress port (reusing the one already stored).
-	oldProtocol := oldInbound.Protocol
-	oldRoutedMtproto := mtprotoRoutesThroughXray(oldInbound)
+	// Keep the routed inbound's existing egress port when possible.
 	if err := s.normalizeMtprotoXrayPort(inbound, oldInbound.Settings); err != nil {
 		return inbound, false, err
 	}
 
-	tag := oldInbound.Tag
-	oldBits := inboundTransports(oldInbound.Protocol, oldInbound.StreamSettings, oldInbound.Settings)
-	oldTagWasAuto := isAutoGeneratedTag(tag, oldInbound.Port, oldInbound.NodeID, oldBits)
-
+	var tag string
 	needRestart := false
 	var postCommitApply func()
 
@@ -2049,11 +2100,26 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		}
 		running := *stored
 		oldInbound = stored
+		oldProtocol := stored.Protocol
+		oldRoutedMtproto := mtprotoRoutesThroughXray(stored)
+		tag = stored.Tag
+		oldBits := inboundTransports(stored.Protocol, stored.StreamSettings, stored.Settings)
+		oldTagWasAuto := isAutoGeneratedTag(tag, stored.Port, stored.NodeID, oldBits)
+		inbound.NodeID = stored.NodeID
+		if s.FromNodeSync && stored.NodeID == nil && hasBandwidthProxyOwners(stored) {
+			return errors.New("proxy bandwidth client bindings must be edited on their local panel")
+		}
+		if s.FromNodeSync || stored.NodeID != nil {
+			inbound.Settings, _ = model.StripInboundProxyBandwidthBindings(inbound.Protocol, inbound.Settings)
+		}
 		// The form posts back the clients and enable it loaded; both have their
 		// own endpoints, so only a master's push may change them here.
 		if !s.FromNodeSync {
 			inbound.Settings = keepStoredClients(inbound.Settings, stored.Settings)
 			inbound.Enable = stored.Enable
+		}
+		if err := validateSavedBandwidthInbound(inbound); err != nil {
+			return err
 		}
 		// On the clients actually saved: a protocol switch keeps the stored ones.
 		if err := s.validateUpdatedInboundClients(inbound, stored); err != nil {
@@ -2288,6 +2354,9 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 			return gcErr
 		}
 		if err := s.clientService.SyncInbound(tx, oldInbound.Id, newClients); err != nil {
+			return err
+		}
+		if err := s.validateSavedBandwidthXrayInbound(tx, oldInbound); err != nil {
 			return err
 		}
 		if oldInbound.NodeID != nil {

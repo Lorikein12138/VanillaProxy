@@ -27,6 +27,22 @@ func commitInboundClientSettings(tx *gorm.DB, ib *model.Inbound, base string) er
 	return tx.Model(&model.Inbound{}).Where("id = ?", ib.Id).Update("settings", ib.Settings).Error
 }
 
+func (s *InboundService) validateCommittedBandwidthInboundClients(tx *gorm.DB, inboundID int) error {
+	if activeBandwidthNode.Load() == nil {
+		return nil
+	}
+	// Read the rebased settings and current enable state after staging
+	// the client records, inbound links and traffic rows.
+	var current model.Inbound
+	if err := tx.First(&current, inboundID).Error; err != nil {
+		return err
+	}
+	if err := validateSavedBandwidthInbound(&current); err != nil {
+		return err
+	}
+	return s.validateSavedBandwidthXrayInbound(tx, &current)
+}
+
 // rebaseClientSettings three-way merges settings JSON: every key and client field
 // ours left as base had it takes current's value; clients are matched by email.
 func rebaseClientSettings(base, ours, current string) (string, error) {

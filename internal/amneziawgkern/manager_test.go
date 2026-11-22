@@ -80,6 +80,9 @@ func (h *fakeHost) run(stdin, name string, args ...string) (string, error) {
 	case "awg":
 		return h.awg(args)
 	case "nft":
+		if len(args) == 3 && args[0] == "-ajn" {
+			return `{"nftables":[]}`, nil
+		}
 		h.nftApply(stdin)
 		return "", nil
 	case "iptables":
@@ -113,6 +116,12 @@ func (h *fakeHost) ip(args []string) error {
 		}
 		l.mtu, _ = strconv.Atoi(args[5])
 		l.up = args[6] == "up"
+	case len(args) == 5 && args[0] == "link" && args[1] == "set" && args[4] == "down":
+		l, ok := h.links[args[3]]
+		if !ok {
+			return errors.New("Cannot find device")
+		}
+		l.up = false
 	default:
 		return fmt.Errorf("fake host: unexpected ip %v", args)
 	}

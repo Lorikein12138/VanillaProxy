@@ -3365,6 +3365,9 @@ export const SCHEMAS: Record<string, unknown> = {
         "description": "AwgServer carries the full AmneziaWG server block (keys, subnet,\nobfuscation params) so the clients page can render a downloadable\nper-client .conf without a second round trip.",
         "nullable": true
       },
+      "bandwidthNodeKey": {
+        "type": "string"
+      },
       "enable": {
         "example": true,
         "type": "boolean"
@@ -3442,6 +3445,7 @@ export const SCHEMAS: Record<string, unknown> = {
       }
     },
     "required": [
+      "bandwidthNodeKey",
       "enable",
       "id",
       "port",

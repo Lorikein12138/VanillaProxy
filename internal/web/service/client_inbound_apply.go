@@ -626,6 +626,9 @@ func (s *ClientService) AddInboundClient(inboundSvc *InboundService, data *model
 		if err := s.ApplyInboundClientDelta(tx, oldInbound.Id, addedClients, nil); err != nil {
 			return err
 		}
+		if err := inboundSvc.validateCommittedBandwidthInboundClients(tx, oldInbound.Id); err != nil {
+			return err
+		}
 		if oldInbound.NodeID != nil {
 			return (&NodeService{}).MarkNodeDirtyTx(tx, *oldInbound.NodeID)
 		}
@@ -1073,6 +1076,9 @@ func (s *ClientService) UpdateInboundClient(inboundSvc *InboundService, data *mo
 		// detachEmails covers the rename the guard above refused: the old record
 		// keeps this inbound's link otherwise, which the full sync used to drop.
 		if err := s.ApplyInboundClientDelta(tx, oldInbound.Id, changedClients, detachEmails); err != nil {
+			return err
+		}
+		if err := inboundSvc.validateCommittedBandwidthInboundClients(tx, oldInbound.Id); err != nil {
 			return err
 		}
 		if oldInbound.NodeID != nil {

@@ -100,7 +100,23 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 // getInbounds retrieves the list of inbounds for the logged-in user.
 func (a *InboundController) getInbounds(c *gin.Context) {
 	user := session.GetLoginUser(c)
-	inbounds, err := a.inboundService.GetInbounds(user.Id)
+	scope := c.GetString("api_token_scope")
+	nodeSnapshot := model.IsNodeSyncApiScope(scope) || scope == model.ApiScopeAdmin && c.GetHeader(wirecodec.MasterPushHeader) == "1"
+	var inbounds any
+	var err error
+	if nodeSnapshot && c.Query(wirecodec.EffectiveNativeAuthQuery) == "1" {
+		includeProxyBindings := c.Query(wirecodec.BandwidthProxyBindingsQuery) == "1"
+		if includeProxyBindings {
+			c.Header("Cache-Control", "no-store")
+		}
+		var inventoryGUID string
+		inbounds, inventoryGUID, err = a.inboundService.GetInboundsForNodeSync(user.Id, includeProxyBindings)
+		if err == nil && inventoryGUID != "" {
+			c.Header(wirecodec.BandwidthProxyInventoryHeader, inventoryGUID)
+		}
+	} else {
+		inbounds, err = a.inboundService.GetInbounds(user.Id)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
 		return
@@ -424,6 +440,7 @@ func (a *InboundController) importInbound(c *gin.Context) {
 	user := session.GetLoginUser(c)
 	inbound.Id = 0
 	inbound.UserId = user.Id
+	inbound.Settings, _ = model.StripInboundProxyBandwidthBindings(inbound.Protocol, inbound.Settings)
 	// Node IDs are panel-local and not portable across panels. Drop a node
 	// reference that is zero or that points to a node which doesn't exist on
 	// this panel, so a cross-panel export imports as a local inbound instead of

@@ -18,16 +18,31 @@ async function fetchClients(): Promise<ClientRecord[]> {
   return validated.obj ?? [];
 }
 
-export function useClientOptions(enabled = true) {
+function useClientOptionsQuery<T>(enabled: boolean, select: (clients: ClientRecord[]) => T) {
   return useQuery({
     queryKey: keys.clients.all(),
     queryFn: fetchClients,
     enabled,
     staleTime: 30_000,
-    select: (clients) =>
-      clients
-        .map((client) => client.email.trim())
-        .filter(Boolean)
-        .sort((a, b) => a.localeCompare(b)),
+    select,
   });
+}
+
+export function useClientOptions(enabled = true) {
+  return useClientOptionsQuery(enabled, (clients) =>
+    clients
+      .map((client) => client.email.trim())
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b)),
+  );
+}
+
+export function useClientIDOptions(enabled = true) {
+  return useClientOptionsQuery(enabled, (clients) =>
+    clients
+      .flatMap((client) =>
+        client.id && client.email ? [{ value: client.id, label: client.email }] : [],
+      )
+      .sort((a, b) => a.label.localeCompare(b.label)),
+  );
 }

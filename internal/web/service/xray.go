@@ -19,6 +19,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/tuic"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/json_util"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/maskcompat"
+	webruntime "github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 
 	"go.uber.org/atomic"
@@ -170,6 +171,28 @@ func RemoveIndex(s []any, index int) []any {
 
 // GetXrayConfig retrieves and builds the Xray configuration from settings and inbounds.
 func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
+	var sidecars bandwidthSidecarInventory
+	return s.getXrayConfigWithBandwidthSidecars(bandwidthSidecarLookup(activeBandwidthNode.Load()), &sidecars)
+}
+
+func (s *XrayService) getXrayConfigWithBandwidthSidecars(automatic func(string, string, string) (string, bool), sidecars *bandwidthSidecarInventory) (*xray.Config, error) {
+	bandwidthNode := activeBandwidthNode.Load() != nil
+	var inbounds []*model.Inbound
+	if bandwidthNode {
+		_, _, _ = s.inboundService.AddTraffic(nil, nil)
+		var err error
+		inbounds, err = s.inboundService.GetAllInbounds()
+		if err != nil {
+			return nil, err
+		}
+		inbounds = slices.DeleteFunc(inbounds, func(inbound *model.Inbound) bool {
+			if err := webruntime.ValidateBandwidthInbound(inbound); err != nil {
+				logBandwidthInboundIsolation(inbound.Tag, string(inbound.Protocol))
+				return true
+			}
+			return false
+		})
+	}
 	templateConfig, err := s.settingService.GetXrayConfigTemplate()
 	if err != nil {
 		return nil, err
@@ -191,6 +214,11 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	xrayConfig.OutboundConfigs = dropXDriveOutboundsRefusedByCore(xrayConfig.OutboundConfigs)
 	// Bridge amneziawg outbounds before anything else reads OutboundConfigs;
 	// the core has no amneziawg proxy and would reject the raw entry.
+	if bandwidthNode {
+		if err := rejectBandwidthAWGOutbounds(xrayConfig); err != nil {
+			return nil, err
+		}
+	}
 	if err := transformAmneziaWGOutbounds(xrayConfig); err != nil {
 		return nil, err
 	}
@@ -198,11 +226,12 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		xrayConfig.OutboundConfigs = forceUserspaceWireGuardTun(xrayConfig.OutboundConfigs)
 	}
 
-	_, _, _ = s.inboundService.AddTraffic(nil, nil)
-
-	inbounds, err := s.inboundService.GetAllInbounds()
-	if err != nil {
-		return nil, err
+	if !bandwidthNode {
+		_, _, _ = s.inboundService.AddTraffic(nil, nil)
+		inbounds, err = s.inboundService.GetAllInbounds()
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, inbound := range inbounds {
 		if !inbound.Enable {
@@ -214,205 +243,10 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		if inbound.Protocol == model.MTProto || inbound.Protocol == model.AmneziaWG || inbound.Protocol == model.TUIC {
 			continue
 		}
-		settings := map[string]any{}
-		_ = json.Unmarshal([]byte(inbound.Settings), &settings)
-		flowAllowed := !inbound.DisableFlow &&
-			inboundCanEnableTlsFlow(string(inbound.Protocol), inbound.StreamSettings, inbound.Settings)
-		var wireguardClientsByEmail map[string]model.Client
-		if inbound.Protocol == model.WireGuard {
-			inboundClients, _ := ParseInboundSettingsClients(inbound.Settings)
-			if len(inboundClients) > 0 {
-				wireguardClientsByEmail = make(map[string]model.Client, len(inboundClients))
-				for _, client := range inboundClients {
-					wireguardClientsByEmail[strings.ToLower(strings.TrimSpace(client.Email))] = client
-				}
-			}
+		inboundConfig, err := s.inboundService.buildGeneratedXrayInbound(nil, inbound, bandwidthNode)
+		if err != nil {
+			return nil, err
 		}
-
-		dbClients, listErr := s.inboundService.clientService.ListForInbound(nil, inbound.Id)
-		if listErr != nil {
-			return nil, listErr
-		}
-
-		clientStats := inbound.ClientStats
-		enableMap := make(map[string]bool, len(clientStats))
-		for _, clientTraffic := range clientStats {
-			enableMap[clientTraffic.Email] = clientTraffic.Enable
-		}
-
-		finalClients := make([]any, 0, len(dbClients))
-		var wgPeers []any
-		for i := range dbClients {
-			c := dbClients[i]
-			if enable, exists := enableMap[c.Email]; exists && !enable {
-				logger.Infof("Remove Inbound User %s due to expiration or traffic limit", c.Email)
-				continue
-			}
-			if !c.Enable {
-				continue
-			}
-			flow := c.Flow
-			if flow == "xtls-rprx-vision-udp443" {
-				flow = "xtls-rprx-vision"
-			}
-			if !flowAllowed {
-				flow = ""
-			}
-			entry := map[string]any{"email": c.Email}
-			switch inbound.Protocol {
-			case model.VLESS:
-				if c.ID != "" {
-					entry["id"] = c.ID
-				}
-				if flow != "" {
-					entry["flow"] = flow
-				}
-				if c.Reverse != nil {
-					entry["reverse"] = c.Reverse
-				}
-			case model.VMESS:
-				if c.ID != "" {
-					entry["id"] = c.ID
-				}
-				if c.Security != "" {
-					entry["security"] = c.Security
-				}
-			case model.Trojan:
-				if c.Password != "" {
-					entry["password"] = c.Password
-				}
-				if flow != "" {
-					entry["flow"] = flow
-				}
-			case model.Shadowsocks:
-				if c.Password != "" {
-					entry["password"] = c.Password
-				}
-			case model.Hysteria:
-				if c.Auth != "" {
-					entry["auth"] = c.Auth
-				}
-			case model.MASQUE:
-				if c.Password != "" {
-					entry["password"] = c.Password
-				}
-			case model.WireGuard:
-				if inboundClient, ok := wireguardClientsByEmail[strings.ToLower(strings.TrimSpace(c.Email))]; ok {
-					c.AllowedIPs = inboundClient.AllowedIPs
-					c.PreSharedKey = inboundClient.PreSharedKey
-					c.PublicKey = inboundClient.PublicKey
-					// #6731: a nil settings keepalive must not keep the other tunnel's value.
-					if inboundClient.KeepAlive == nil {
-						c.KeepAlive = nil
-					} else {
-						keepalive := *inboundClient.KeepAlive
-						c.KeepAlive = &keepalive
-					}
-				}
-				wgPeers = append(wgPeers, model.WireguardPeerFromClient(c))
-				continue
-			}
-			finalClients = append(finalClients, entry)
-		}
-
-		var mutated bool
-		if inbound.Protocol == model.WireGuard {
-			delete(settings, "clients")
-			if wgPeers == nil {
-				wgPeers = []any{}
-			}
-			settings["peers"] = wgPeers
-			mutated = true
-		} else {
-			_, hadClients := settings["clients"]
-			mutated = hadClients || len(finalClients) > 0
-			if mutated {
-				settings["clients"] = finalClients
-			}
-		}
-
-		if inboundCanHostFallbacks(inbound) {
-			fallbacks, fbErr := s.inboundService.fallbackService.BuildFallbacksJSON(nil, inbound.Id)
-			if fbErr != nil {
-				return nil, fbErr
-			}
-			if len(fallbacks) > 0 {
-				generic := make([]any, 0, len(fallbacks))
-				for _, f := range fallbacks {
-					generic = append(generic, f)
-				}
-				settings["fallbacks"] = generic
-				mutated = true
-			}
-		}
-
-		if mutated {
-			modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
-			if err != nil {
-				return nil, err
-			}
-			inbound.Settings = string(modifiedSettings)
-		}
-
-		if len(inbound.StreamSettings) > 0 {
-			// Unmarshal stream JSON
-			var stream map[string]any
-			_ = json.Unmarshal([]byte(inbound.StreamSettings), &stream)
-
-			// Remove the "settings" field under "tlsSettings" and "realitySettings"
-			tlsSettings, ok1 := stream["tlsSettings"].(map[string]any)
-			realitySettings, ok2 := stream["realitySettings"].(map[string]any)
-			if ok1 || ok2 {
-				if ok1 {
-					delete(tlsSettings, "settings")
-				} else if ok2 {
-					delete(realitySettings, "settings")
-				}
-			}
-
-			delete(stream, "externalProxy")
-
-			// finalmask.tcp + REALITY panics Xray-core on the first connection
-			// (XTLS/Xray-core#6453). AddInbound/UpdateInbound reject this
-			// combination at save time, but a row saved before that guard
-			// existed (upgrade, node sync, restored backup, direct DB edit)
-			// would still crash Xray on the next restart without this — drop
-			// it here too, the same way liftXhttpSessionIDKeys and
-			// HealShadowsocksClientMethods heal other legacy data in place.
-			if len(finalMaskRealityTcpMasks(stream)) > 0 {
-				logger.Warningf("Inbound %q: dropping finalmask, incompatible with REALITY security (crashes Xray-core, see XTLS/Xray-core#6453)", inbound.Tag)
-				delete(stream, "finalmask")
-			}
-
-			dropEmptyRandPackets(stream["finalmask"])
-
-			if dropped := stripIncompleteXmcMasks(stream); dropped > 0 {
-				logger.Warningf("Inbound %q: dropping %d XMC finalmask mask(s) without complete Minecraft profiles — reconfigure them to restore the obfuscation (see XTLS/Xray-core#6487)", inbound.Tag, dropped)
-			}
-
-			// A row that skipped the save path can still carry an xdns shape older than 26.10.10.
-			maskcompat.UpgradeLegacyXdns(stream["finalmask"])
-
-			// xray-core v26.6.22 (#6258) renamed the XHTTP session keys and
-			// kept no fallback. Lift legacy sessionPlacement/sessionKey onto the
-			// new names here so inbounds stored before the rename keep working
-			// without the admin re-saving them.
-			liftXhttpSessionIDKeys(stream)
-
-			newStream, err := json.MarshalIndent(stream, "", "  ")
-			if err != nil {
-				return nil, err
-			}
-			inbound.StreamSettings = string(newStream)
-		}
-
-		if inbound.Protocol == model.Shadowsocks {
-			if healed, ok := model.HealShadowsocksClientMethods(inbound.Settings); ok {
-				inbound.Settings = healed
-			}
-		}
-
-		inboundConfig := inbound.GenXrayInboundConfig()
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
 	}
 	xrayConfig.InboundConfigs = dropInboundsRefusedByXDrive(xrayConfig.InboundConfigs)
@@ -425,6 +259,11 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	subSvc := &OutboundSubscriptionService{}
 	if prepend, appendList, err := subSvc.activeOutboundsSplit(); err == nil && (len(prepend) > 0 || len(appendList) > 0) {
 		mergeSubscriptionOutbounds(xrayConfig, prepend, appendList)
+	}
+	if bandwidthNode {
+		if err := rejectBandwidthAWGOutbounds(xrayConfig); err != nil {
+			return nil, err
+		}
 	}
 
 	// Route opted-in local mtproto inbounds through the core's router. Each one
@@ -449,8 +288,44 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	// hop. Whether it goes anywhere beyond Xray's default routing is up to
 	// whatever rules the admin adds through the stock Routing page, exactly
 	// like routing any other protocol.
-	injectAmneziawgnetSocks(xrayConfig, inbounds)
-	tuicInstances := configuredTuicInstances(inbounds)
+	var tuicInstances []tuic.Instance
+	if bandwidthNode {
+		instances, err := s.inboundService.desiredTuicInstances(inbounds)
+		if err != nil {
+			return nil, err
+		}
+		tuicInstances = instances
+		awgInstances, err := desiredAmneziaWGInstances(inbounds)
+		if err != nil {
+			return nil, err
+		}
+		if automatic != nil {
+			sidecars.tuic, err = selectBandwidthTuicInstances(tuicInstances, automatic)
+			if err != nil {
+				return nil, err
+			}
+			sidecars.awg, err = selectBandwidthAWGInstances(awgInstances, automatic)
+			if err != nil {
+				return nil, err
+			}
+			tuicInstances = make([]tuic.Instance, 0, len(sidecars.tuic))
+			for _, desired := range sidecars.tuic {
+				tuicInstances = append(tuicInstances, desired.Instance)
+			}
+			awgInstances = make([]amneziawg.Instance, 0, len(sidecars.awg))
+			for _, desired := range sidecars.awg {
+				awgInstances = append(awgInstances, desired.Instance)
+			}
+		} else {
+			awgInstances = slices.DeleteFunc(awgInstances, func(inst amneziawg.Instance) bool { return inst.KernelMode })
+		}
+		if err := injectAmneziaWGRelayInstances(xrayConfig, awgInstances, true); err != nil {
+			return nil, err
+		}
+	} else {
+		tuicInstances = configuredTuicInstances(inbounds)
+		injectAmneziawgnetSocks(xrayConfig, inbounds)
+	}
 	if err := injectTuicRelay(xrayConfig, tuicInstances); err != nil {
 		return nil, err
 	}
@@ -777,26 +652,40 @@ const amneziawgEgressSniffingSettings = `{"enabled":true,"destOverride":["http",
 // (internal/web/service/inbound_traffic.go's addClientTraffic) match by
 // exact tag -- reusing it isn't a style choice.
 func injectAmneziawgnetSocks(cfg *xray.Config, inbounds []*model.Inbound) {
+	var instances []amneziawg.Instance
+	for _, inbound := range inbounds {
+		if !inbound.Enable || inbound.NodeID != nil {
+			continue
+		}
+		if inst, ok := amneziawg.InstanceFromInbound(inbound); ok {
+			instances = append(instances, inst)
+		}
+	}
+	if err := injectAmneziaWGRelayInstances(cfg, instances, false); err != nil {
+		logger.Warning("amneziawgnet socks:", err)
+	}
+}
+
+func injectAmneziaWGRelayInstances(cfg *xray.Config, instances []amneziawg.Instance, managed bool) error {
 	existingTags := make(map[string]struct{}, len(cfg.InboundConfigs))
 	for i := range cfg.InboundConfigs {
 		existingTags[cfg.InboundConfigs[i].Tag] = struct{}{}
 	}
 
-	for _, inbound := range inbounds {
-		if inbound.Protocol != model.AmneziaWG || !inbound.Enable || inbound.NodeID != nil {
-			continue
-		}
-		inst, ok := amneziawg.InstanceFromInbound(inbound)
-		if !ok {
-			continue
-		}
+	for _, inst := range instances {
 		// Kernel-mode inbounds forward in the kernel and never dial Xray, so a
 		// relay inbound for them would listen forever with nothing behind it.
 		if inst.KernelMode {
+			if managed {
+				return fmt.Errorf("bandwidth-managed node requires embedded AmneziaWG on inbound %q", inst.Tag)
+			}
 			continue
 		}
-		if _, taken := existingTags[inbound.Tag]; taken {
-			logger.Warning("amneziawgnet socks: inbound tag [", inbound.Tag, "] already present in generated config, skipping its relay inbound")
+		if _, taken := existingTags[inst.Tag]; taken {
+			if managed {
+				return fmt.Errorf("AmneziaWG relay tag %q conflicts with another inbound", inst.Tag)
+			}
+			logger.Warning("amneziawgnet socks: inbound tag [", inst.Tag, "] already present in generated config, skipping its relay inbound")
 			continue
 		}
 
@@ -810,22 +699,28 @@ func injectAmneziawgnetSocks(cfg *xray.Config, inbounds []*model.Inbound) {
 			continue
 		}
 
+		if managed {
+			slices.Sort(emails)
+			emails = slices.Compact(emails)
+		}
 		settings, err := amneziawgnet.SocksInboundSettings(emails, amneziawgnet.SocksPassword())
 		if err != nil {
-			logger.Warning("amneziawgnet socks: building settings for inbound [", inbound.Tag, "]: ", err)
-			continue
+			return fmt.Errorf("AmneziaWG relay inbound %q: %w", inst.Tag, err)
 		}
 
-		existingTags[inbound.Tag] = struct{}{}
+		existingTags[inst.Tag] = struct{}{}
 		cfg.InboundConfigs = append(cfg.InboundConfigs, xray.InboundConfig{
-			Listen:   json_util.RawMessage(`"127.0.0.1"`),
-			Port:     amneziawgnet.SOCKSPortForInbound(inbound.Id),
-			Protocol: "socks",
-			Settings: json_util.RawMessage(settings),
-			Sniffing: json_util.RawMessage(amneziawgEgressSniffingSettings),
-			Tag:      inbound.Tag,
+			AmneziaWGRelay:     true,
+			AmneziaWGInboundID: inst.Id,
+			Listen:             json_util.RawMessage(`"127.0.0.1"`),
+			Port:               amneziawgnet.SOCKSPortForInbound(inst.Id),
+			Protocol:           "socks",
+			Settings:           json_util.RawMessage(settings),
+			Sniffing:           json_util.RawMessage(amneziawgEgressSniffingSettings),
+			Tag:                inst.Tag,
 		})
 	}
+	return nil
 }
 
 // Keep sniffed domains available for routing without replacing the requested destination.
@@ -1137,7 +1032,7 @@ func ensureAPIServices(api json_util.RawMessage) json_util.RawMessage {
 		return api
 	}
 	var parsed map[string]any
-	if err := json.Unmarshal(api, &parsed); err != nil {
+	if err := json.Unmarshal(api, &parsed); err != nil || parsed == nil {
 		return api
 	}
 	services, _ := parsed["services"].([]any)
@@ -1482,14 +1377,38 @@ func (s *XrayService) RestartXray(isForce bool) error {
 	lock.Lock()
 	defer lock.Unlock()
 	logger.Debug("restart Xray, force:", isForce)
+	bandwidthNode := activeBandwidthNode.Load()
+	if bandwidthNode != nil && bandwidthNode.closing.Load() {
+		return errors.New("bandwidth node is shutting down")
+	}
 	if !isForce && isManuallyStopped.Load() {
 		return nil
 	}
 	isManuallyStopped.Store(false)
 
-	xrayConfig, err := s.GetXrayConfig()
+	automatic := bandwidthSidecarLookup(bandwidthNode)
+	var sidecars *bandwidthSidecarInventory
+	if automatic != nil {
+		sidecars = &bandwidthSidecarInventory{}
+	}
+	xrayConfig, err := s.getXrayConfigWithBandwidthSidecars(automatic, sidecars)
 	if err != nil {
+		if bandwidthNode != nil {
+			current := currentXrayProcess()
+			stopBandwidthRelays(current)
+			if automatic != nil && current != nil && current.IsRunning() {
+				if stopErr := current.Stop(); stopErr != nil && !errors.Is(stopErr, ErrXrayNotRunning) {
+					err = errors.Join(err, stopErr)
+				}
+			}
+			bandwidthNode.xrayPolicyReady = false
+			bandwidthNode.xrayIdle.Store(false)
+			xrayState.holdBack(err.Error())
+		}
 		return err
+	}
+	if bandwidthNode != nil {
+		return s.restartBandwidthXray(bandwidthNode, xrayConfig, isForce, automatic, sidecars)
 	}
 
 	process := currentXrayProcess()
@@ -1767,9 +1686,20 @@ func (s *XrayService) StopXray() error {
 	defer lock.Unlock()
 	isManuallyStopped.Store(true)
 	logger.Debug("Attempting to stop Xray...")
+	managedErr := stopUnpublishedBandwidthXray()
 	process := currentXrayProcess()
+	if activeBandwidthNode.Load() != nil {
+		stopBandwidthRelays(process)
+	}
 	if process != nil && process.IsRunning() {
-		return process.Stop()
+		err := process.Stop()
+		if managedErr != nil {
+			return errors.Join(managedErr, err)
+		}
+		return err
+	}
+	if managedErr != nil {
+		return managedErr
 	}
 	return ErrXrayNotRunning
 }
@@ -1818,8 +1748,11 @@ func (s *XrayService) ApplyPendingRestart() {
 	}
 }
 
-// DidXrayCrash checks if Xray crashed by verifying it's not running and wasn't manually stopped.
+// DidXrayCrash reports an absent core when it is expected to be running.
 func (s *XrayService) DidXrayCrash() bool {
+	if node := activeBandwidthNode.Load(); node != nil && node.xrayIdle.Load() {
+		return false
+	}
 	return !s.IsXrayRunning() && !isManuallyStopped.Load()
 }
 

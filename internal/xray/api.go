@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
 	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/masque"
@@ -141,16 +142,9 @@ func (x *XrayAPI) AddInbound(inbound []byte) error {
 	}
 	client := *x.HandlerServiceClient
 
-	conf := new(conf.InboundDetourConfig)
-	err := json.Unmarshal(inbound, conf)
+	config, err := BuildInboundConfig(inbound)
 	if err != nil {
-		logger.Debug("Failed to unmarshal inbound:", err)
-		return err
-	}
-	localizeNoiseScripts(conf.StreamSetting)
-	config, err := conf.Build()
-	if err != nil {
-		logger.Debug("Failed to build inbound Detur:", err)
+		logger.Debug("Failed to build inbound:", err)
 		return err
 	}
 	inboundConfig := command.AddInboundRequest{Inbound: config}
@@ -160,6 +154,17 @@ func (x *XrayAPI) AddInbound(inbound []byte) error {
 	_, err = client.AddInbound(ctx, &inboundConfig)
 
 	return err
+}
+
+// BuildInboundConfig decodes and builds a single Xray inbound without starting a listener.
+func BuildInboundConfig(inbound []byte) (*core.InboundHandlerConfig, error) {
+	ensureXrayAssetLocation()
+	var detour conf.InboundDetourConfig
+	if err := json.Unmarshal(inbound, &detour); err != nil {
+		return nil, err
+	}
+	localizeNoiseScripts(detour.StreamSetting)
+	return detour.Build()
 }
 
 // DelInbound removes an inbound configuration from the Xray core by tag.

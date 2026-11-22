@@ -1,5 +1,6 @@
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useQuery } from '@tanstack/react-query';
 import {
   AutoComplete,
   Button,
@@ -38,6 +39,12 @@ import { resolveExternalLinkExpiry } from '@/lib/clients/external-link';
 import { useDatepicker } from '@/hooks/useDatepicker';
 import { useClientHwids } from '@/hooks/useClientHwids';
 import { useRawHostsQuery } from '@/api/queries/useRawHostsQuery';
+import { keys } from '@/api/queryKeys';
+import {
+  fetchClientBandwidth,
+  saveClientBandwidth,
+  type ClientBandwidthPolicy,
+} from '@/api/queries/clientBandwidth';
 import { DateTimePicker, SelectAllClearButtons } from '@/components/form';
 import { FormField, rhfZodValidate } from '@/components/form/rhf';
 import ClientHwidListModal from '@/components/clients/ClientHwidList';
@@ -55,6 +62,7 @@ import type {
 } from '@/hooks/useClients';
 import { useFail2banStatusQuery, getLimitIpNotice } from '@/api/queries/useFail2banStatusQuery';
 import ClientRenewalFields from './ClientRenewalFields';
+import ClientBandwidthFields, { getBandwidthNodeKeys } from './ClientBandwidthFields';
 import { ClientFormSchema, ClientCreateFormSchema, type ClientFormValues } from '@/schemas/client';
 import './ClientFormModal.css';
 
@@ -113,6 +121,23 @@ interface SaveMetaCreate {
 interface SaveCreatePayload {
   client: Record<string, unknown>;
   inboundIds: number[];
+}
+
+interface SavedEdit {
+  email: string;
+  inboundIds: number[];
+  signature: string;
+}
+
+function sameBandwidthPolicy(
+  left: ClientBandwidthPolicy,
+  right: ClientBandwidthPolicy,
+  nodeKeys: Set<string>,
+) {
+  return (
+    left.totalBitsPerSecond === right.totalBitsPerSecond &&
+    [...nodeKeys].every((key) => left.nodeBitsPerSecond[key] === right.nodeBitsPerSecond[key])
+  );
 }
 
 interface ClientFormModalProps {
@@ -293,6 +318,18 @@ export default function ClientFormModal({
   } = useFieldArray({ control: methods.control, name: 'externalLinks' });
 
   const [submitting, setSubmitting] = useState(false);
+  const [activeTab, setActiveTab] = useState('basic');
+  const [bandwidthDraft, setBandwidthDraft] = useState<ClientBandwidthPolicy | null>(null);
+  const initialClientValues = useRef<Values | null>(null);
+  const savedEdit = useRef<SavedEdit | null>(null);
+  const clientEmail = client?.email ?? '';
+  const bandwidth = useQuery({
+    queryKey: keys.clients.bandwidth(clientEmail),
+    queryFn: ({ signal }) => fetchClientBandwidth(clientEmail, signal),
+    enabled: open && isEdit && !!clientEmail && activeTab === 'bandwidth' && !bandwidthDraft,
+    staleTime: 0,
+    retry: false,
+  });
   const [resetting, setResetting] = useState(false);
   const [clientIps, setClientIps] = useState<ClientIpInfo[]>([]);
   const [ipsLoading, setIpsLoading] = useState(false);
@@ -351,6 +388,10 @@ export default function ClientFormModal({
 
   useEffect(() => {
     if (!open) return;
+    setActiveTab('basic');
+    setBandwidthDraft(null);
+    initialClientValues.current = null;
+    savedEdit.current = null;
     setIpsModalOpen(false);
     setHwidsModalOpen(false);
 
@@ -415,6 +456,7 @@ export default function ClientFormModal({
         seed.delayedDays = 0;
         seed.expiryDate = et > 0 ? et : 0;
       }
+      initialClientValues.current = seed;
       methods.reset(seed);
       void loadIps();
       void loadHwids();
@@ -433,7 +475,7 @@ export default function ClientFormModal({
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, isEdit]);
+  }, [open, isEdit, clientEmail]);
 
   const flowCapableIds = useMemo(() => {
     const ids = new Set<number>();
@@ -537,6 +579,18 @@ export default function ClientFormModal({
     methods.setValue('secret', generateMtprotoSecret(mtprotoDomain));
   }
 
+  const setAutomaticClientValue = useCallback(
+    (name: 'flow' | 'reverseTag' | 'password' | 'secret', value: string) => {
+      // Keep automatic defaults out of the comparison for bandwidth-only saves.
+      const initialValues = initialClientValues.current;
+      if (initialValues && methods.getValues(name) === initialValues[name]) {
+        initialClientValues.current = { ...initialValues, [name]: value };
+      }
+      methods.setValue(name, value);
+    },
+    [methods],
+  );
+
   useEffect(() => {
     // Only clear the flow once we actually have inbound options to judge
     // capability from. While the options list is momentarily empty (e.g. the
@@ -544,29 +598,29 @@ export default function ClientFormModal({
     // is a false negative, so clearing here would silently drop a valid
     // xtls-rprx-vision flow the user picked for a Reality/TLS inbound.
     if (inbounds.length > 0 && !showFlow && flow) {
-      methods.setValue('flow', '');
+      setAutomaticClientValue('flow', '');
     }
-  }, [inbounds, showFlow, flow, methods]);
+  }, [inbounds, showFlow, flow, setAutomaticClientValue]);
 
   useEffect(() => {
     if (!showReverseTag && reverseTag) {
-      methods.setValue('reverseTag', '');
+      setAutomaticClientValue('reverseTag', '');
     }
-  }, [showReverseTag, reverseTag, methods]);
+  }, [showReverseTag, reverseTag, setAutomaticClientValue]);
 
   useEffect(() => {
     if (!ss2022Method) return;
     const current = methods.getValues('password');
     if (!RandomUtil.isShadowsocks2022Password(current, ss2022Method)) {
-      methods.setValue('password', RandomUtil.randomShadowsocksPassword(ss2022Method));
+      setAutomaticClientValue('password', RandomUtil.randomShadowsocksPassword(ss2022Method));
     }
-  }, [ss2022Method, methods]);
+  }, [ss2022Method, methods, setAutomaticClientValue]);
 
   useEffect(() => {
     if (showMtproto && !secret) {
-      methods.setValue('secret', generateMtprotoSecret(mtprotoDomain));
+      setAutomaticClientValue('secret', generateMtprotoSecret(mtprotoDomain));
     }
-  }, [showMtproto, secret, mtprotoDomain, methods]);
+  }, [showMtproto, secret, mtprotoDomain, setAutomaticClientValue]);
 
   const inboundOptions = useMemo(
     () =>
@@ -712,8 +766,57 @@ export default function ClientFormModal({
     }
   }
 
+  async function submitBandwidth(email: string, policy: ClientBandwidthPolicy) {
+    const msg = await saveClientBandwidth(email, policy);
+    if (!msg.success) {
+      setActiveTab('bandwidth');
+      messageApi.error(msg.msg || t('pages.clients.bandwidth.saveError'));
+    }
+    return msg.success;
+  }
+
   async function onSubmit() {
+    if (submitting) return;
     const values = methods.getValues();
+    let bandwidthPolicy: ClientBandwidthPolicy | undefined;
+    if (isEdit && bandwidthDraft && bandwidth.data) {
+      const nodeKeys = getBandwidthNodeKeys(
+        inbounds,
+        values.inboundIds || [],
+        bandwidth.data.accountNodeKeys,
+      );
+      if (!sameBandwidthPolicy(bandwidthDraft, bandwidth.data, nodeKeys)) {
+        const { totalBitsPerSecond } = bandwidthDraft;
+        const nodeBitsPerSecond = Object.fromEntries(
+          Object.entries(bandwidthDraft.nodeBitsPerSecond).filter(([key]) => nodeKeys.has(key)),
+        );
+        if (
+          totalBitsPerSecond > 0 &&
+          Object.values(nodeBitsPerSecond).some((rate) => rate > totalBitsPerSecond)
+        ) {
+          setActiveTab('bandwidth');
+          messageApi.error(t('pages.clients.bandwidth.nodeExceedsTotal'));
+          return;
+        }
+        bandwidthPolicy = { totalBitsPerSecond, nodeBitsPerSecond };
+      }
+    }
+
+    if (
+      client &&
+      bandwidthPolicy &&
+      !savedEdit.current &&
+      JSON.stringify(values) === JSON.stringify(initialClientValues.current)
+    ) {
+      setSubmitting(true);
+      try {
+        if (await submitBandwidth(client.email, bandwidthPolicy)) close();
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     const unchangedLegacyKeepAlive =
       isEdit &&
       typeof client?.keepAlive === 'number' &&
@@ -868,24 +971,31 @@ export default function ClientFormModal({
     try {
       let msg;
       if (isEdit && client) {
-        const original = new Set(attachedIds || []);
-        const next = new Set(values.inboundIds || []);
-        const toAttach = [...next].filter((id) => !original.has(id));
-        const toDetach = [...original].filter((id) => !next.has(id));
-        msg = await save(clientPayload, {
-          isEdit: true,
-          email: client.email,
-          attach: toAttach,
-          detach: toDetach,
-          externalLinks,
-        });
+        const editedEmail = values.email.trim();
+        const editedInboundIds = values.inboundIds || [];
+        const signature = JSON.stringify([clientPayload, editedInboundIds, externalLinks]);
+        if (signature !== savedEdit.current?.signature) {
+          const original = new Set(savedEdit.current?.inboundIds ?? attachedIds);
+          const next = new Set(editedInboundIds);
+          msg = await save(clientPayload, {
+            isEdit: true,
+            email: savedEdit.current?.email ?? client.email,
+            attach: [...next].filter((id) => !original.has(id)),
+            detach: [...original].filter((id) => !next.has(id)),
+            externalLinks,
+          });
+          if (!msg?.success) return;
+          savedEdit.current = { email: editedEmail, inboundIds: editedInboundIds, signature };
+        }
+        if (bandwidthPolicy && !(await submitBandwidth(editedEmail, bandwidthPolicy))) return;
+        close();
       } else {
         msg = await save(
           { client: clientPayload, inboundIds: values.inboundIds },
           { isEdit: false, email: clientPayload.email as string, externalLinks },
         );
+        if (msg?.success) close();
       }
-      if (msg?.success) close();
     } finally {
       setSubmitting(false);
     }
@@ -905,7 +1015,9 @@ export default function ClientFormModal({
         styles={{
           body: { maxHeight: 'calc(100vh - 160px)', overflowY: 'auto', overflowX: 'hidden' },
         }}
-        onCancel={close}
+        onCancel={() => {
+          if (!submitting) close();
+        }}
         footer={
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {isEdit && resetTraffic && (
@@ -928,7 +1040,9 @@ export default function ClientFormModal({
               </Popconfirm>
             )}
             <div style={{ marginInlineStart: 'auto', display: 'flex', gap: 8 }}>
-              <Button onClick={close}>{t('cancel')}</Button>
+              <Button onClick={close} disabled={submitting}>
+                {t('cancel')}
+              </Button>
               <Button type="primary" loading={submitting} onClick={onSubmit}>
                 {isEdit ? t('save') : t('create')}
               </Button>
@@ -939,7 +1053,8 @@ export default function ClientFormModal({
         <FormProvider {...methods}>
           <Form layout="vertical">
             <Tabs
-              defaultActiveKey="basic"
+              activeKey={activeTab}
+              onChange={setActiveTab}
               items={[
                 {
                   key: 'basic',
@@ -1708,6 +1823,25 @@ export default function ClientFormModal({
                     </>
                   ),
                 },
+                ...(isEdit && clientEmail
+                  ? [
+                      {
+                        key: 'bandwidth',
+                        label: t('pages.clients.bandwidth.tab'),
+                        children: (
+                          <ClientBandwidthFields
+                            policy={bandwidth.data && { ...bandwidth.data, ...bandwidthDraft }}
+                            inbounds={inbounds}
+                            inboundIds={inboundIds || []}
+                            loading={bandwidth.isFetching || !bandwidth.isFetched}
+                            disabled={submitting || (bandwidth.isFetching && !bandwidthDraft)}
+                            onRetry={() => void bandwidth.refetch()}
+                            onChange={setBandwidthDraft}
+                          />
+                        ),
+                      },
+                    ]
+                  : []),
               ]}
             />
           </Form>

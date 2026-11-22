@@ -946,6 +946,9 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 		UpdateColumn("enable", updated.Enable).Error; err != nil {
 		return needRestart, err
 	}
+	if updated.Email != existing.Email || updated.Enable != existing.Enable {
+		requestBandwidthProxyOwnerReconcile(id)
+	}
 
 	if err := s.setClientLimitHwidByEmail(updated.Email, limitHwid); err != nil {
 		return needRestart, err
@@ -1041,11 +1044,12 @@ func (s *ClientService) Delete(inboundSvc *InboundService, id int, keepTraffic b
 				return err
 			}
 		}
-		return tx.Delete(&model.ClientRecord{}, id).Error
+		return deleteClientRecords(tx, []int{id})
 	}); err != nil {
 		withdrawClientTombstones(existing.Email)
 		return needRestart, err
 	}
+	requestBandwidthProxyOwnerReconcile(id)
 	return needRestart, nil
 }
 

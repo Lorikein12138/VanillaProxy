@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -59,6 +60,9 @@ type DeviceOptions struct {
 	// Logger is passed to device.NewDevice as-is; nil uses a silent logger
 	// (device.NewLogger(device.LogLevelSilent, "")).
 	Logger *device.Logger
+	// Bandwidth optionally gates an embedded server's inner IP packets.
+	// A managed device keeps its peer configuration fixed until closed.
+	Bandwidth *BandwidthOptions
 }
 
 // Device is one running embedded AmneziaWG interface: an amneziawg-go
@@ -66,12 +70,37 @@ type DeviceOptions struct {
 // attach a TCP/UDP forwarder (see forwarder.go / udp.go). Closing it tears
 // down both the WireGuard device and the underlying tun/stack.
 type Device struct {
-	*device.Device
-	Stack *stack.Stack
+	engine *device.Device
+	Stack  *stack.Stack
+
+	bandwidthConfig string
+	configured      atomic.Bool
 
 	// localAddrs snapshots the netstack interface addresses (gVisor exposes
 	// no read-back); set once at construction, read-only afterwards.
 	localAddrs []netip.Addr
+}
+
+func (d *Device) Close()                  { d.engine.Close() }
+func (d *Device) Up() error               { return d.engine.Up() }
+func (d *Device) Down() error             { return d.engine.Down() }
+func (d *Device) Wait() chan struct{}     { return d.engine.Wait() }
+func (d *Device) IpcGet() (string, error) { return d.engine.IpcGet() }
+
+// IpcSet allows in-place updates of devices without a bandwidth gate.
+func (d *Device) IpcSet(conf string) error {
+	if d.bandwidthConfig != "" {
+		return errFixedBandwidthDevice
+	}
+	return d.engine.IpcSet(conf)
+}
+
+// LookupPeer returns the engine peer on devices without a bandwidth gate.
+func (d *Device) LookupPeer(key device.NoisePublicKey) *device.Peer {
+	if d.bandwidthConfig != "" {
+		return nil
+	}
+	return d.engine.LookupPeer(key)
 }
 
 // LocalAddresses returns the configured tunnel-local address(es).
@@ -97,7 +126,7 @@ func NewDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device, error) {
 	return dev, nil
 }
 
-// newUnconfiguredDevice builds the tun/netstack/device trio but does not
+// NewUnconfiguredDevice builds the tun/netstack/device trio but does not
 // configure any peers or bring the interface up -- a caller that will relay
 // real traffic MUST attach its TCP/UDP handlers (AttachTCPForwarder /
 // AttachUDPHandler) against the returned Device.Stack BEFORE calling
@@ -117,6 +146,10 @@ func NewDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device, error) {
 // stack.(*Stack).SetTransportProtocolHandler (the attaching goroutine,
 // writing it). See manager.go's ensureLocked rebuild branch for the real
 // call order this function exists to support.
+func NewUnconfiguredDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device, error) {
+	return newUnconfiguredDevice(inst, opts)
+}
+
 func newUnconfiguredDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device, error) {
 	addrs, err := hostAddresses(inst.Address)
 	if err != nil {
@@ -125,7 +158,19 @@ func newUnconfiguredDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device
 
 	mtu := amneziawg.EffectiveMTU(inst.MTU, inst.Obfuscation.S4)
 
-	tun, gstack, err := createNetTUNWithStack(addrs, mtu)
+	var bandwidth *tunBandwidth
+	var conf string
+	if opts.Bandwidth != nil {
+		bandwidth, err = newTunBandwidth(inst, opts)
+		if err != nil {
+			return nil, fmt.Errorf("amneziawgnet: %w", err)
+		}
+		conf, err = buildUAPIConfig(inst, opts)
+		if err != nil {
+			return nil, fmt.Errorf("amneziawgnet: %w", err)
+		}
+	}
+	tun, gstack, err := createNetTUNWithBandwidth(addrs, mtu, bandwidth)
 	if err != nil {
 		return nil, fmt.Errorf("amneziawgnet: create netstack: %w", err)
 	}
@@ -137,7 +182,7 @@ func newUnconfiguredDevice(inst amneziawg.Instance, opts DeviceOptions) (*Device
 	bind := newResolvingBind(inst.Listen)
 	dev := device.NewDevice(tun, bind, logger)
 
-	return &Device{Device: dev, Stack: gstack, localAddrs: addrs}, nil
+	return &Device{engine: dev, Stack: gstack, localAddrs: addrs, bandwidthConfig: conf}, nil
 }
 
 // Configure applies inst/opts to d via UAPI and brings the interface up.
@@ -153,7 +198,14 @@ func (d *Device) Configure(inst amneziawg.Instance, opts DeviceOptions) error {
 		d.Close()
 		return fmt.Errorf("amneziawgnet: %w", err)
 	}
-	if err := d.IpcSet(conf); err != nil {
+	if d.bandwidthConfig != "" {
+		if conf != d.bandwidthConfig || !d.configured.CompareAndSwap(false, true) {
+			return errFixedBandwidthDevice
+		}
+	} else if opts.Bandwidth != nil {
+		return errFixedBandwidthDevice
+	}
+	if err := d.engine.IpcSet(conf); err != nil {
 		d.Close()
 		return fmt.Errorf("amneziawgnet: IpcSet for inbound %d: %w", inst.Id, err)
 	}

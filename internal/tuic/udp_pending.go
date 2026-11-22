@@ -43,7 +43,7 @@ func (r *udpAssociationRegistry) queuePacket(ctx context.Context, id uint16, exp
 	if r.associations[id] != expected {
 		return nil, nil, errUdpAssociationClosed
 	}
-	if expected.relay != nil && !expected.opening {
+	if expected.relay != nil && !expected.draining && !r.queueRelayedPackets {
 		return expected.relay, nil, nil
 	}
 	charge := len(payload) + udpPacketOverhead
@@ -54,24 +54,21 @@ func (r *udpAssociationRegistry) queuePacket(ctx context.Context, id uint16, exp
 	addr := *target
 	addr.IP = append([]byte(nil), target.IP...)
 	expected.pending = append(expected.pending, pendingUdpPacket{target: &addr, payload: append([]byte(nil), payload...)})
-	if expected.opening {
+	if expected.draining {
 		return nil, nil, nil
 	}
-	expected.opening = true
-	opening, cancel := context.WithCancel(ctx)
-	expected.openCancel = cancel
-	return nil, opening, nil
+	expected.draining = true
+	if expected.ctx == nil {
+		expected.ctx, expected.cancel = context.WithCancel(ctx)
+	}
+	return nil, expected.ctx, nil
 }
 
 func (r *udpAssociationRegistry) nextPending(id uint16, expected *udpAssociation) (pendingUdpPacket, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.associations[id] != expected || len(expected.pending) == 0 {
-		expected.opening = false
-		if expected.openCancel != nil {
-			expected.openCancel()
-			expected.openCancel = nil
-		}
+		expected.draining = false
 		return pendingUdpPacket{}, false
 	}
 	packet := expected.pending[0]
@@ -99,10 +96,11 @@ func (r *udpAssociationRegistry) clearPendingLocked(association *udpAssociation)
 		r.releasePendingPacketLocked(packet)
 	}
 	association.pending = nil
-	association.opening = false
-	if association.openCancel != nil {
-		association.openCancel()
-		association.openCancel = nil
+	association.draining = false
+	if association.cancel != nil {
+		association.cancel()
+		association.ctx = nil
+		association.cancel = nil
 	}
 }
 

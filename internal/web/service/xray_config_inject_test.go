@@ -73,6 +73,9 @@ func TestEnsureAPIServices(t *testing.T) {
 	if got := ensureAPIServices(nil); got != nil {
 		t.Fatalf("nil api block must stay nil, got %s", got)
 	}
+	if got := ensureAPIServices(json_util.RawMessage(`null`)); string(got) != "null" {
+		t.Fatalf("explicitly disabled api block must stay null, got %s", got)
+	}
 }
 
 func TestEnsureStatsPolicy(t *testing.T) {

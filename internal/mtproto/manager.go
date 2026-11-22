@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthexchange"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 )
@@ -44,6 +47,9 @@ type Instance struct {
 	Listen  string
 	Port    int
 	Secrets []SecretEntry
+
+	// Bandwidth enables the node's shared gate for this instance.
+	Bandwidth *BandwidthOptions
 
 	// Optional mtg tuning; each is omitted from the generated TOML when
 	// zero-valued so mtg falls back to its own defaults.
@@ -86,7 +92,7 @@ func (inst Instance) bindTo() string {
 // structuralFingerprint changes whenever a value outside the [secrets] section
 // of the generated TOML changes. Such a change can only be applied by
 // restarting mtg, unlike a secrets-only change, which a reload-capable mtg can
-// absorb in place.
+// absorb in place. The manager adds the bandwidth launch snapshot's digest.
 func (inst Instance) structuralFingerprint() string {
 	parts := []string{
 		inst.bindTo(),
@@ -109,9 +115,14 @@ func (inst Instance) structuralFingerprint() string {
 // secretsFingerprint identifies the reloadable secret config regardless of
 // client order, so a reordered clients array in the stored settings does not
 // read as a change. It moves whenever a client is added, removed, disabled,
-// re-keyed, re-tagged, or re-limited (quota/expiry) — all of which mtg applies
-// in place without dropping connections.
+// re-keyed, re-tagged, or re-limited (quota/expiry).
 func (inst Instance) secretsFingerprint() string {
+	if inst.Bandwidth != nil {
+		// Encode names and values unambiguously for security-sensitive reloads,
+		// without retaining raw credentials in the comparison state.
+		payload, _ := json.Marshal(secretsPayload(inst))
+		return fmt.Sprintf("%x", sha256.Sum256(payload))
+	}
 	pairs := make([]string, 0, len(inst.Secrets))
 	for _, e := range inst.Secrets {
 		pairs = append(pairs, fmt.Sprintf("%s=%s;tag=%s;q=%d;exp=%d", e.Name, e.Secret, e.AdTag, e.QuotaBytes, e.ExpiresUnix))
@@ -135,19 +146,27 @@ type clientCounters struct {
 }
 
 type managed struct {
-	proc         *Process
-	tag          string
-	structuralFP string
-	secretsFP    string
-	apiPort      int
-	apiToken     string
-	last         map[string]clientCounters
+	proc           *Process
+	tag            string
+	structuralFP   string
+	secretsFP      string
+	apiPort        int
+	apiToken       string
+	last           map[string]clientCounters
+	startFailed    bool
+	policyBindings map[string]string
+}
+
+func (cur *managed) isReady() bool {
+	return !cur.startFailed && cur.proc != nil && cur.proc.IsRunning()
 }
 
 // Manager owns the set of running mtg processes keyed by inbound id.
 type Manager struct {
-	mu    sync.Mutex
-	procs map[int]*managed
+	mu               sync.Mutex
+	procs            map[int]*managed
+	prepareBandwidth func(Instance) (*BandwidthOptions, error)
+	started          bool
 	// swept records that the one-time startup cleanup of orphaned mtg
 	// processes (survivors of a previous x-ui run) has already run.
 	swept bool
@@ -164,6 +183,24 @@ func GetManager() *Manager {
 		manager = &Manager{procs: map[int]*managed{}}
 	})
 	return manager
+}
+
+// ConfigureBandwidth installs the shared bandwidth policy for this manager
+// before its first sidecar launch. prepare runs under the manager lock for
+// each desired instance with active secrets and must not call back into Manager.
+func (m *Manager) ConfigureBandwidth(prepare func(Instance) (*BandwidthOptions, error)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch {
+	case prepare == nil:
+		return errors.New("mtproto: bandwidth preparation is required")
+	case m.prepareBandwidth != nil:
+		return errors.New("mtproto: bandwidth is already configured")
+	case m.started:
+		return errors.New("mtproto: configure bandwidth before starting a sidecar")
+	}
+	m.prepareBandwidth = prepare
+	return nil
 }
 
 // InstanceFromInbound derives a desired Instance from an mtproto inbound,
@@ -262,12 +299,11 @@ func (m *Manager) Ensure(inst Instance) error {
 	return m.ensureLocked(inst)
 }
 
-// sweepOrphansLocked kills mtg processes left running by a previous x-ui run,
-// exactly once per process lifetime and before any of our own mtg are started.
-// Because x-ui owns every mtg process, anything alive at this point is an orphan
-// that would otherwise keep holding an inbound port with a stale secret.
+// sweepOrphansLocked preserves the legacy orphan cleanup in stock mode.
+// Bandwidth-managed panels check for their own stock children at startup
+// without killing processes that share the same binary name.
 func (m *Manager) sweepOrphansLocked() {
-	if m.swept {
+	if m.swept || m.prepareBandwidth != nil {
 		return
 	}
 	m.swept = true
@@ -289,23 +325,47 @@ const (
 
 // ensureActionFor decides how to apply a desired instance to the currently
 // managed process. A structural change (or a dead process) forces a restart; a
-// secrets-only change is a candidate for an in-place reload; identical
-// fingerprints on a live process need nothing.
-func ensureActionFor(running bool, curStructFP, curSecretsFP, newStructFP, newSecretsFP string) ensureAction {
+// secrets-only change can be applied in place when live reload is allowed.
+// Identical fingerprints on a live process need nothing.
+func ensureActionFor(running, canReloadSecrets bool, curStructFP, curSecretsFP, newStructFP, newSecretsFP string) ensureAction {
 	if !running || curStructFP != newStructFP {
 		return ensureRestart
 	}
 	if curSecretsFP != newSecretsFP {
+		if !canReloadSecrets {
+			return ensureRestart
+		}
 		return ensureReload
 	}
 	return ensureNoop
 }
 
 func (m *Manager) ensureLocked(inst Instance) error {
+	if len(inst.Secrets) == 0 && (m.prepareBandwidth != nil || inst.Bandwidth != nil) {
+		return m.stopAndRemoveConfig(inst.Id)
+	}
+	handshake, err := m.prepareBandwidthHandshake(&inst)
+	if err != nil {
+		// Leaving a previous process running could preserve stale identities or
+		// allow stock mtg to keep serving an inbound that now requires the gate.
+		if stopErr := m.stopAndRemoveConfig(inst.Id); stopErr != nil {
+			return errors.Join(err, stopErr)
+		}
+		return err
+	}
+	if len(inst.Secrets) == 0 && inst.Bandwidth != nil && inst.Bandwidth.PolicyBindings != nil {
+		return m.stopAndRemoveConfig(inst.Id)
+	}
 	structFP := inst.structuralFingerprint()
+	if handshake != nil {
+		structFP += fmt.Sprintf("|bandwidth=%x", sha256.Sum256(handshake))
+	}
 	secFP := inst.secretsFingerprint()
 	if cur, ok := m.procs[inst.Id]; ok {
-		switch ensureActionFor(cur.proc.IsRunning(), cur.structuralFP, cur.secretsFP, structFP, secFP) {
+		// A FakeTLS handshake in flight may still hold the old secrets and
+		// register its connection after the management API closes stale ones.
+		canReloadSecrets := handshake == nil
+		switch ensureActionFor(cur.isReady(), canReloadSecrets, cur.structuralFP, cur.secretsFP, structFP, secFP) {
 		case ensureNoop:
 			cur.tag = inst.Tag
 			return nil
@@ -322,8 +382,9 @@ func (m *Manager) ensureLocked(inst Instance) error {
 			logger.Warningf("mtproto: live secret update unavailable for inbound %d, restarting", inst.Id)
 			fallthrough
 		case ensureRestart:
-			_ = cur.proc.Stop()
-			delete(m.procs, inst.Id)
+			if err := m.stopAndForget(inst.Id, cur); err != nil {
+				return err
+			}
 		}
 	}
 	apiPort, err := FreeLocalPort()
@@ -339,19 +400,62 @@ func (m *Manager) ensureLocked(inst Instance) error {
 		return err
 	}
 	proc := newProcess(cfgPath, fmt.Sprintf("inbound %d", inst.Id))
+	proc.bandwidthHandshake = handshake
+	if m.procs == nil {
+		m.procs = make(map[int]*managed)
+	}
 	if err := proc.Start(); err != nil {
+		if proc.IsRunning() {
+			// Keep an unready child private so removal or reconciliation can
+			// retry termination and never overwrite its port or credentials.
+			m.started = true
+			m.procs[inst.Id] = &managed{proc: proc, startFailed: true}
+		} else if handshake != nil {
+			return errors.Join(err, m.stopAndRemoveConfig(inst.Id))
+		}
 		return err
 	}
+	m.started = true
+	var policyBindings map[string]string
+	if inst.Bandwidth != nil {
+		policyBindings = maps.Clone(inst.Bandwidth.PolicyBindings)
+	}
 	m.procs[inst.Id] = &managed{
-		proc:         proc,
-		tag:          inst.Tag,
-		structuralFP: structFP,
-		secretsFP:    secFP,
-		apiPort:      apiPort,
-		apiToken:     apiToken,
-		last:         map[string]clientCounters{},
+		proc:           proc,
+		tag:            inst.Tag,
+		structuralFP:   structFP,
+		secretsFP:      secFP,
+		apiPort:        apiPort,
+		apiToken:       apiToken,
+		last:           map[string]clientCounters{},
+		policyBindings: policyBindings,
 	}
 	logger.Infof("mtproto: started mtg for inbound %d on %s", inst.Id, inst.bindTo())
+	return nil
+}
+
+func (m *Manager) stopAndForget(id int, cur *managed) error {
+	cur.startFailed = true
+	err := cur.proc.Stop()
+	if cur.proc.IsRunning() {
+		if err != nil {
+			return fmt.Errorf("mtproto: stop inbound %d: %w", id, err)
+		}
+		return fmt.Errorf("mtproto: inbound %d is still running after stop", id)
+	}
+	delete(m.procs, id)
+	return nil
+}
+
+func (m *Manager) stopAndRemoveConfig(id int) error {
+	if cur, ok := m.procs[id]; ok {
+		if err := m.stopAndForget(id, cur); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(configPathForID(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return nil
 }
 
@@ -359,10 +463,11 @@ func (m *Manager) ensureLocked(inst Instance) error {
 func (m *Manager) Remove(id int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.procs[id]; ok {
-		_ = cur.proc.Stop()
-		delete(m.procs, id)
-		_ = os.Remove(configPathForID(id))
+	if _, ok := m.procs[id]; ok {
+		if err := m.stopAndRemoveConfig(id); err != nil {
+			logger.Warning(err.Error())
+			return
+		}
 		logger.Infof("mtproto: stopped mtg for inbound %d", id)
 	}
 }
@@ -370,36 +475,59 @@ func (m *Manager) Remove(id int) {
 // Reconcile drives the running set toward the desired instances: it stops
 // processes that are no longer wanted and (re)starts the rest. Used at boot
 // and periodically to recover from crashes.
-func (m *Manager) Reconcile(desired []Instance) {
+func (m *Manager) Reconcile(desired []Instance) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sweepOrphansLocked()
+	var errs []error
 	want := make(map[int]struct{}, len(desired))
 	for _, inst := range desired {
 		want[inst.Id] = struct{}{}
 	}
-	for id, cur := range m.procs {
+	for id := range m.procs {
 		if _, ok := want[id]; !ok {
-			_ = cur.proc.Stop()
-			delete(m.procs, id)
-			_ = os.Remove(configPathForID(id))
+			if err := m.stopAndRemoveConfig(id); err != nil {
+				logger.Warning(err.Error())
+				errs = append(errs, err)
+			}
 		}
 	}
 	for _, inst := range desired {
 		if err := m.ensureLocked(inst); err != nil {
 			logger.Warningf("mtproto: reconcile failed for inbound %d: %v", inst.Id, err)
+			errs = append(errs, fmt.Errorf("mtproto: reconcile inbound %d: %w", inst.Id, err))
 		}
 	}
+	return errors.Join(errs...)
+}
+
+// ReadyBandwidthBindings reports exact automatic bindings acknowledged by
+// running patched children. A child that is still starting publishes nothing.
+func (m *Manager) ReadyBandwidthBindings() map[string][]bandwidthexchange.PolicyBinding {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ready := make(map[string][]bandwidthexchange.PolicyBinding)
+	for _, cur := range m.procs {
+		if !cur.isReady() {
+			continue
+		}
+		for name, fingerprint := range cur.policyBindings {
+			ready[name] = append(ready[name], bandwidthexchange.PolicyBinding{
+				Protocol: string(model.MTProto), Fingerprint: fingerprint,
+			})
+		}
+	}
+	return ready
 }
 
 // StopAll stops every managed mtg process. Called on panel shutdown.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id, cur := range m.procs {
-		_ = cur.proc.Stop()
-		_ = os.Remove(configPathForID(id))
-		delete(m.procs, id)
+	for id := range m.procs {
+		if err := m.stopAndRemoveConfig(id); err != nil {
+			logger.Warning(err.Error())
+		}
 	}
 }
 
@@ -417,7 +545,7 @@ func (m *Manager) CollectTraffic() ([]Traffic, []string) {
 	m.mu.Lock()
 	snaps := make([]snap, 0, len(m.procs))
 	for id, cur := range m.procs {
-		if cur.proc == nil || !cur.proc.IsRunning() {
+		if !cur.isReady() {
 			continue
 		}
 		lastCopy := make(map[string]clientCounters, len(cur.last))
@@ -459,7 +587,7 @@ func (m *Manager) CollectTraffic() ([]Traffic, []string) {
 		}
 
 		m.mu.Lock()
-		if cur, ok := m.procs[s.id]; ok {
+		if cur, ok := m.procs[s.id]; ok && !cur.startFailed {
 			cur.last = newLast
 		}
 		m.mu.Unlock()
@@ -471,7 +599,7 @@ func (m *Manager) HasRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, cur := range m.procs {
-		if cur.proc != nil && cur.proc.IsRunning() {
+		if cur.isReady() {
 			return true
 		}
 	}
@@ -489,7 +617,7 @@ func (m *Manager) ResetQuota(email string) {
 	m.mu.Lock()
 	targets := make([]target, 0, len(m.procs))
 	for _, cur := range m.procs {
-		if cur.proc != nil && cur.proc.IsRunning() {
+		if cur.isReady() {
 			targets = append(targets, target{cur.apiPort, cur.apiToken})
 		}
 	}

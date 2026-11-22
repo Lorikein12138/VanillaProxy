@@ -769,6 +769,7 @@ export interface InboundFallback {
 
 export interface InboundOption {
   awgServer?: ServerSettings | null;
+  bandwidthNodeKey: string;
   enable: boolean;
   id: number;
   listen?: string;

@@ -865,6 +865,9 @@ func (s *NodeService) Delete(id int) error {
 		if err := tx.Where("node_id = ?", id).Delete(&model.NodeClientTraffic{}).Error; err != nil {
 			return err
 		}
+		if err := deleteRemoteBandwidthProxyBindings(tx, id); err != nil {
+			return err
+		}
 		if err := tx.Where("node_id = ?", id).Delete(&model.NodePendingReset{}).Error; err != nil {
 			return err
 		}
@@ -890,7 +893,17 @@ func (s *NodeService) Delete(id int) error {
 
 func (s *NodeService) SetEnable(id int, enable bool) error {
 	db := database.GetDB()
-	if err := db.Model(model.Node{}).Where("id = ?", id).Update("enable", enable).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(map[string]any{
+			"enable": enable, "config_dirty_at": time.Now().UnixMilli(),
+		}).Error; err != nil {
+			return err
+		}
+		if !enable {
+			return freezeRemoteBandwidthProxyBindings(tx, id)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if mgr := runtime.GetManager(); mgr != nil {
@@ -1007,7 +1020,16 @@ func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 		updates["guid"] = p.Guid
 		s.warnOnDuplicateGuid(id, p.Guid)
 	}
-	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return err
+		}
+		if p.Guid != "" {
+			return tx.Model(&model.RemoteBandwidthProxyBinding{}).Where("node_id = ? AND origin_guid <> ? AND policy_active", id, p.Guid).
+				Update("policy_active", false).Error
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if p.Status == "online" {
@@ -1047,7 +1069,9 @@ func (s *NodeService) warnOnDuplicateGuid(id int, guid string) {
 }
 
 func (s *NodeService) MarkNodeDirty(id int) error {
-	return s.MarkNodeDirtyTx(database.GetDB(), id)
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		return s.MarkNodeDirtyTx(tx, id)
+	})
 }
 
 func (s *NodeService) MarkNodeDirtyTx(tx *gorm.DB, id int) error {
@@ -1057,12 +1081,15 @@ func (s *NodeService) MarkNodeDirtyTx(tx *gorm.DB, id int) error {
 	if tx == nil {
 		return errors.New("nil db transaction")
 	}
-	return tx.Model(model.Node{}).
+	if err := tx.Model(model.Node{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"config_dirty":    true,
 			"config_dirty_at": time.Now().UnixMilli(),
-		}).Error
+		}).Error; err != nil {
+		return err
+	}
+	return freezeRemoteBandwidthProxyBindings(tx, id)
 }
 
 func (s *NodeService) ClearNodeDirty(id int, dirtyAt int64) error {

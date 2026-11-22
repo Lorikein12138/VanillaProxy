@@ -47,7 +47,7 @@ func (j *TuicJob) Run() {
 	}
 
 	mgr := tuic.GetManager()
-	mgr.Reconcile(desired)
+	service.ReconcileTuicInstances(desired)
 
 	_, clientDeltas := mgr.CollectAllTraffic()
 	onlineEmails, _ := mgr.GetActiveClients(30 * time.Second)
@@ -67,7 +67,7 @@ func (j *TuicJob) Run() {
 			persisted = false
 		} else if needRestart {
 			if desired, err := j.inboundService.DesiredTuicInstances(); err == nil {
-				mgr.Reconcile(desired)
+				service.ReconcileTuicInstances(desired)
 			}
 		}
 	}

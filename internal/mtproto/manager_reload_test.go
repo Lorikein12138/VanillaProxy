@@ -1,8 +1,10 @@
 package mtproto
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,9 +19,30 @@ import (
 // manager can start and stop it without a real mtg-multi binary.
 func TestMain(m *testing.M) {
 	if os.Getenv("MTG_FAKE_CHILD") == "1" {
+		bandwidth := len(os.Args) == 4 && os.Args[1] == "run" && os.Args[2] == bandwidthFlag
+		stock := os.Getenv("MTG_FAKE_STOCK") == "1"
+		var handshake bandwidthBootstrap
+		if bandwidth && !stock {
+			stdin, err := io.ReadAll(io.LimitReader(os.Stdin, maxBandwidthHandshakeSize+1))
+			if err != nil || len(stdin) > maxBandwidthHandshakeSize ||
+				json.Unmarshal(stdin, &handshake) != nil || len(handshake.ClientIDs) == 0 || !handshake.Ready.Valid() {
+				os.Exit(2)
+			}
+		}
 		if f, err := os.OpenFile(os.Getenv("MTG_FAKE_PIDFILE"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 			fmt.Fprintf(f, "%d\n", os.Getpid())
 			f.Close()
+		}
+		if bandwidth && stock {
+			os.Exit(1)
+		}
+		if bandwidth && os.Getenv("MTG_FAKE_READY") != "silent" {
+			if os.Getenv("MTG_FAKE_READY") == "wrong" {
+				handshake.Ready.Nonce[0] ^= 0xff
+			}
+			if err := handshake.Ready.Notify(context.Background()); err != nil {
+				os.Exit(3)
+			}
 		}
 		if exitFile := os.Getenv("MTG_FAKE_EXIT_FILE"); exitFile != "" {
 			for {
@@ -94,19 +117,21 @@ func mtgInst(id int, secrets ...SecretEntry) Instance {
 func TestEnsureActionFor(t *testing.T) {
 	cases := []struct {
 		name                                         string
-		running                                      bool
+		running, canReloadSecrets                    bool
 		curStruct, curSecrets, newStruct, newSecrets string
 		want                                         ensureAction
 	}{
-		{"dead process restarts", false, "s", "a", "s", "a", ensureRestart},
-		{"structural change restarts", true, "s1", "a", "s2", "a", ensureRestart},
-		{"secrets change reloads", true, "s", "a", "s", "b", ensureReload},
-		{"identical is a noop", true, "s", "a", "s", "a", ensureNoop},
-		{"dead beats a secrets-only change", false, "s", "a", "s", "b", ensureRestart},
+		{"dead process restarts", false, true, "s", "a", "s", "a", ensureRestart},
+		{"structural change restarts", true, true, "s1", "a", "s2", "a", ensureRestart},
+		{"stock secrets change reloads", true, true, "s", "a", "s", "b", ensureReload},
+		{"bandwidth secrets change restarts", true, false, "s", "a", "s", "b", ensureRestart},
+		{"identical is a noop", true, true, "s", "a", "s", "a", ensureNoop},
+		{"identical bandwidth is a noop", true, false, "s", "a", "s", "a", ensureNoop},
+		{"dead beats a secrets-only change", false, true, "s", "a", "s", "b", ensureRestart},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ensureActionFor(tc.running, tc.curStruct, tc.curSecrets, tc.newStruct, tc.newSecrets); got != tc.want {
+			if got := ensureActionFor(tc.running, tc.canReloadSecrets, tc.curStruct, tc.curSecrets, tc.newStruct, tc.newSecrets); got != tc.want {
 				t.Fatalf("ensureActionFor = %d, want %d", got, tc.want)
 			}
 		})
@@ -193,7 +218,7 @@ func TestEnsureHotReloadKeepsProcess(t *testing.T) {
 	defer srv.Close()
 	mgr.procs[1].apiPort = serverPort(t, srv)
 
-	rekeyed := mtgInst(1, SecretEntry{Name: "alice", Secret: "ee01"}, SecretEntry{Name: "bob", Secret: "ee02"})
+	rekeyed := mtgInst(1, SecretEntry{Name: "alice", Secret: "ee03"})
 	if err := mgr.Ensure(rekeyed); err != nil {
 		t.Fatalf("reload ensure: %v", err)
 	}
@@ -216,7 +241,7 @@ func TestEnsureHotReloadKeepsProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if !strings.Contains(string(cfg), `"bob" = "ee02"`) {
+	if !strings.Contains(string(cfg), `"alice" = "ee03"`) {
 		t.Fatalf("reloaded config must carry the new secret:\n%s", cfg)
 	}
 	if !strings.Contains(string(cfg), fmt.Sprintf("api-bind-to = \"127.0.0.1:%d\"", serverPort(t, srv))) {

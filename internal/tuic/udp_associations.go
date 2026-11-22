@@ -18,8 +18,9 @@ type udpAssociation struct {
 	responseTransport uint8
 	relay             *udpRelaySession
 	lastActive        time.Time
-	opening           bool
-	openCancel        context.CancelFunc
+	draining          bool
+	ctx               context.Context
+	cancel            context.CancelFunc
 	pending           []pendingUdpPacket
 }
 
@@ -31,6 +32,7 @@ type udpAssociationRegistry struct {
 	maxPacketSize       int
 	pendingBytes        int
 	pendingBudget       *pendingUdpBudget
+	queueRelayedPackets bool
 }
 
 func newUdpAssociationRegistry(maxPacketSize int) *udpAssociationRegistry {
@@ -81,7 +83,7 @@ func validPacketFragment(hdr *PacketHeader, payload []byte, maxPacketSize int) b
 		(hdr.FragID == 0 || hdr.Addr == nil || hdr.Addr.Type == AddrTypeNone)
 }
 
-func (r *udpAssociationRegistry) ensureRelay(ctx context.Context, assocID uint16, expected *udpAssociation, user *User, relay *SocksRelay) (*udpAssociation, bool, error) {
+func (r *udpAssociationRegistry) ensureRelay(ctx context.Context, assocID uint16, expected *udpAssociation, dial func(context.Context) (*SocksUDPSession, error)) (*udpAssociation, bool, error) {
 	r.mu.Lock()
 	association := r.associations[assocID]
 	if association == nil || association != expected {
@@ -95,7 +97,7 @@ func (r *udpAssociationRegistry) ensureRelay(ctx context.Context, assocID uint16
 	}
 	r.mu.Unlock()
 
-	socksSession, err := relay.DialUDP(ctx, user.Email)
+	socksSession, err := dial(ctx)
 	if err != nil {
 		return nil, false, err
 	}

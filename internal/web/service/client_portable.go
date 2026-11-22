@@ -272,29 +272,34 @@ func applyPortableTraffic(tx *gorm.DB, inboundSvc *InboundService, item ClientCr
 // DeleteOrphans removes every unattached client plus its traffic, IP log, and
 // external links in one transaction; returns how many clients were deleted.
 func (s *ClientService) DeleteOrphans() (int, error) {
-	db := database.GetDB()
-	sub := database.GetDB().Table("client_inbounds").Select("client_id")
-	var rows []model.ClientRecord
-	if err := db.Where("id NOT IN (?)", sub).Order("id ASC").Find(&rows).Error; err != nil {
-		return 0, err
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-
-	ids := make([]int, 0, len(rows))
-	emails := make([]string, 0, len(rows))
-	subIDs := make([]string, 0, len(rows))
-	for i := range rows {
-		ids = append(ids, rows[i].Id)
-		if rows[i].Email != "" {
-			emails = append(emails, rows[i].Email)
-		}
-		subIDs = append(subIDs, rows[i].SubID)
-	}
-	tombstoneClientEmails(emails)
-
+	var deleted int
 	if err := runSerializedTx(func(tx *gorm.DB) error {
+		sub := tx.Table("client_inbounds").Select("client_id")
+		var rows []model.ClientRecord
+		if err := tx.Where("id NOT IN (?)", sub).Order("id ASC").Find(&rows).Error; err != nil || len(rows) == 0 {
+			return err
+		}
+		linked, err := bandwidthProxyLinkedClients(tx)
+		if err != nil {
+			return err
+		}
+		ids := make([]int, 0, len(rows))
+		emails := make([]string, 0, len(rows))
+		subIDs := make([]string, 0, len(rows))
+		for _, row := range rows {
+			if linked[row.Id] {
+				continue
+			}
+			ids = append(ids, row.Id)
+			if row.Email != "" {
+				emails = append(emails, row.Email)
+			}
+			subIDs = append(subIDs, row.SubID)
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		tombstoneClientEmails(emails)
 		if e := adjustGroupBaselinesForRemovedTraffic(tx, emails); e != nil {
 			return e
 		}
@@ -323,13 +328,14 @@ func (s *ClientService) DeleteOrphans() (int, error) {
 			}
 		}
 		for _, batch := range chunkInts(ids, sqlInChunk) {
-			if e := tx.Where("id IN ?", batch).Delete(&model.ClientRecord{}).Error; e != nil {
+			if e := deleteClientRecords(tx, batch); e != nil {
 				return e
 			}
 		}
+		deleted = len(ids)
 		return nil
 	}); err != nil {
 		return 0, err
 	}
-	return len(ids), nil
+	return deleted, nil
 }

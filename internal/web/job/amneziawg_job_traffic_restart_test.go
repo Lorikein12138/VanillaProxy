@@ -232,3 +232,75 @@ func TestKernelToEmbeddedWaitsForKernelTeardownRetry(t *testing.T) {
 		t.Fatalf("embedded reconcile after teardown = %v, want inbound %d", embeddedManager.started, id)
 	}
 }
+
+type testBandwidthKernelApply func([]amneziawgkern.Desired) error
+
+func (f testBandwidthKernelApply) ReconcileBandwidth(desired []amneziawgkern.Desired) error {
+	return f(desired)
+}
+
+func TestBandwidthKernelApplyReleasesEmbeddedAndReportsStartupFailure(t *testing.T) {
+	const id = 92
+	desired := []amneziawgkern.Desired{{Instance: amneziawg.Instance{Id: id, KernelMode: true}}}
+	embedded := &transitionEmbeddedManager{}
+	failure := errors.New("unavailable kernel gate")
+	kernel := testBandwidthKernelApply(func(got []amneziawgkern.Desired) error {
+		if len(embedded.removed) != 1 || embedded.removed[0] != id {
+			t.Fatalf("embedded datapath was not stopped before kernel start: %v", embedded.removed)
+		}
+		if len(got) != 1 || got[0].Instance.Id != id {
+			t.Fatalf("kernel received %v, want inbound %d", got, id)
+		}
+		return failure
+	})
+	if err := reconcileBandwidthKernel(desired, embedded, kernel); !errors.Is(err, failure) {
+		t.Fatalf("startup failure was lost: %v", err)
+	}
+}
+
+func TestBandwidthKernelTrafficUsesInstalledPeerBeforeRemovalOrRename(t *testing.T) {
+	const (
+		id         = 93
+		iface      = "xui-awg93"
+		publicKey  = "peer-key"
+		oldAccount = "old@example.test"
+		newAccount = "new@example.test"
+	)
+	for _, desired := range [][]amneziawgkern.Desired{
+		nil,
+		{{Instance: amneziawg.Instance{Id: id, Peers: []amneziawg.Peer{{PublicKey: publicKey, Email: newAccount}}}}},
+	} {
+		collector := amneziawgkern.NewCollector()
+		manager := &kernelTrafficTestManager{id: id, state: amneziawgkern.TrafficInterfaceState{
+			Name: iface, Generation: 1, PeerEmails: map[string]string{publicKey: oldAccount},
+			PeerTrafficIDs: map[string]int{publicKey: 71},
+		}}
+		current := []amneziawgkern.PeerStat{{PublicKey: publicKey, RxBytes: 120, TxBytes: 50}}
+		dump := func(string) ([]amneziawgkern.PeerStat, error) { return current, nil }
+		// No previous cron tick or cached email. The installed generation owns
+		// these bytes even if the database's desired set has already changed.
+		traffic := readKernelTraffic(desired, manager, collector, dump)
+		if len(traffic) != 1 || traffic[0].Email != oldAccount || traffic[0].AWGTrafficID != 71 || traffic[0].Up != 120 || traffic[0].Down != 50 {
+			t.Fatalf("last traffic attributed to the wrong peer: %v", traffic)
+		}
+		if repeated := readKernelTraffic(nil, manager, collector, dump); len(repeated) != 0 {
+			t.Fatal("the same sample was billed twice")
+		}
+		// Teardown forgets the old counters. A same-name replacement starts
+		// with a new generation and the metadata that was actually installed.
+		collector.Forget(iface)
+		manager.state.Generation++
+		manager.state.PeerEmails = map[string]string{publicKey: newAccount}
+		manager.state.PeerTrafficIDs = map[string]int{publicKey: 72}
+		current[0].RxBytes, current[0].TxBytes = 12, 5
+		replaced := readKernelTraffic(nil, manager, collector, dump)
+		if len(replaced) != 1 || replaced[0].Email != newAccount || replaced[0].AWGTrafficID != 72 || replaced[0].Up != 12 || replaced[0].Down != 5 {
+			t.Fatalf("new generation inherited old state: %v", replaced)
+		}
+		current[0].RxBytes += 10
+		delete(manager.state.PeerTrafficIDs, publicKey)
+		if unbound := readKernelTraffic(nil, manager, collector, dump); len(unbound) != 0 {
+			t.Fatalf("managed peer without a ledger ID was billed by email: %v", unbound)
+		}
+	}
+}

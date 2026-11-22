@@ -2,7 +2,9 @@ package amneziawgkern
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -32,9 +34,15 @@ type Desired struct {
 
 // managed is one live interface and the spec it was last brought to.
 type managed struct {
-	spec                   spec
-	trafficGeneration      uint64
-	trafficBaselinePending bool
+	spec                    spec
+	trafficGeneration       uint64
+	trafficBaselinePending  bool
+	bandwidthGate           interfaceBandwidthGate
+	bandwidthRoutes         []BandwidthRoute
+	bandwidthIndex          int
+	bandwidthPeerEmails     map[string]string
+	bandwidthPeerTrafficIDs map[string]int
+	bandwidthPeers          []bandwidthPeerAuthorization
 }
 
 // TrafficInterfaceState identifies one managed interface generation.
@@ -42,6 +50,11 @@ type TrafficInterfaceState struct {
 	Name       string
 	Generation uint64
 	Adopted    bool
+	// PeerEmails maps the installed managed peers' canonical dump keys to
+	// their emails. Stock generations leave this nil.
+	PeerEmails map[string]string
+	// PeerTrafficIDs binds the same dump keys to stable traffic ledger rows.
+	PeerTrafficIDs map[string]int
 }
 
 // host is the part of the OS the manager drives; tests substitute a fake.
@@ -62,6 +75,7 @@ type Manager struct {
 	generation uint64
 	host       host
 	confDir    string
+	bandwidth  *kernelBandwidthPolicy
 }
 
 var (
@@ -85,10 +99,13 @@ func newManager(h host, confDir string) *Manager {
 func (m *Manager) Ensure(d Desired) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.ensureLocked(d)
+	return m.ensureLocked(d, m.bandwidthAccountLookup())
 }
 
-func (m *Manager) ensureLocked(d Desired) error {
+func (m *Manager) ensureLocked(d Desired, lookup func(string, string, string) (string, bool)) error {
+	if m.bandwidth != nil {
+		return m.ensureBandwidthLocked(d, lookup)
+	}
 	s, err := buildSpec(d)
 	if err != nil {
 		return err
@@ -100,6 +117,9 @@ func (m *Manager) ensureLocked(d Desired) error {
 	owned, found, err := readOwnedConfig(m.confDir, id)
 	if err != nil {
 		return err
+	}
+	if isBandwidthOwnedConfig(owned, s.name) {
+		return fmt.Errorf("amneziawgkern: refusing stock operation on bandwidth-owned interface %s", s.name)
 	}
 	if linkUp && !isManaged {
 		if !found {
@@ -196,23 +216,38 @@ func (m *Manager) adopt(s spec) error {
 }
 
 func (m *Manager) createLink(s spec) error {
+	if _, err := m.createLinkDown(s); err != nil {
+		return err
+	}
+	return m.activateLink(s)
+}
+
+func (m *Manager) createLinkDown(s spec) (bool, error) {
 	if !m.host.moduleLoaded() {
 		if out, err := m.host.run("", "modprobe", "amneziawg"); err != nil {
-			return fmt.Errorf("amneziawgkern: modprobe amneziawg: %w (%s)", err, out)
+			return false, fmt.Errorf("amneziawgkern: modprobe amneziawg: %w (%s)", err, out)
 		}
 	}
+	if out, err := m.host.run("", "ip", "link", "add", "dev", s.name, "type", "amneziawg"); err != nil {
+		return false, fmt.Errorf("amneziawgkern: ip link add %s: %w (%s)", s.name, err, out)
+	}
 	steps := [][]string{
-		{"ip", "link", "add", "dev", s.name, "type", "amneziawg"},
 		{"awg", "setconf", s.name, ConfPathIn(m.confDir, s.name)},
 	}
 	for _, a := range s.addresses {
 		steps = append(steps, []string{"ip", "-4", "address", "add", a, "dev", s.name})
 	}
-	steps = append(steps, []string{"ip", "link", "set", "dev", s.name, "mtu", fmt.Sprint(s.mtu), "up"})
 	for _, step := range steps {
 		if out, err := m.host.run("", step[0], step[1:]...); err != nil {
-			return fmt.Errorf("amneziawgkern: %s: %w (%s)", strings.Join(step, " "), err, out)
+			return true, fmt.Errorf("amneziawgkern: %s: %w (%s)", strings.Join(step, " "), err, out)
 		}
+	}
+	return true, nil
+}
+
+func (m *Manager) activateLink(s spec) error {
+	if out, err := m.host.run("", "ip", "link", "set", "dev", s.name, "mtu", fmt.Sprint(s.mtu), "up"); err != nil {
+		return fmt.Errorf("amneziawgkern: ip link set %s up: %w (%s)", s.name, err, out)
 	}
 	return nil
 }
@@ -316,6 +351,10 @@ func (f forwardRules) rules() [][]string {
 // verifyLiveInterface refuses a live link whose key is not the owned config's.
 // A keyless link is one a crashed create left behind.
 func (m *Manager) verifyLiveInterface(name, config string) error {
+	return m.verifyLiveInterfaceKey(name, config, true)
+}
+
+func (m *Manager) verifyLiveInterfaceKey(name, config string, allowKeyless bool) error {
 	want, err := configInterfacePublicKey(config)
 	if err != nil {
 		return fmt.Errorf("amneziawgkern: refusing to manage %s: %w", name, err)
@@ -324,7 +363,7 @@ func (m *Manager) verifyLiveInterface(name, config string) error {
 	if err != nil {
 		return fmt.Errorf("amneziawgkern: refusing to manage %s: cannot verify live AmneziaWG interface: %w", name, err)
 	}
-	if got = strings.TrimSpace(got); got != want && got != "(none)" && got != "" {
+	if got = strings.TrimSpace(got); got != want && !(allowKeyless && (got == "(none)" || got == "")) {
 		return fmt.Errorf("amneziawgkern: refusing to manage %s: live interface key does not match its owned config", name)
 	}
 	return nil
@@ -335,7 +374,11 @@ func (m *Manager) verifyLiveInterface(name, config string) error {
 func (m *Manager) Reconcile(desired []Desired) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	_ = m.reconcileLocked(desired)
+}
 
+func (m *Manager) reconcileLocked(desired []Desired) error {
+	var problems []error
 	want := make(map[int]struct{}, len(desired))
 	for _, d := range desired {
 		want[d.Instance.Id] = struct{}{}
@@ -348,6 +391,7 @@ func (m *Manager) Reconcile(desired []Desired) {
 		attempted[id] = struct{}{}
 		if err := m.teardown(id); err != nil {
 			logger.Warning("amneziawgkern: stopping removed inbound ", id, ": ", err)
+			problems = append(problems, fmt.Errorf("stop inbound %d: %w", id, err))
 			continue
 		}
 		logger.Info("amneziawgkern: stopped kernel interface for removed inbound ", id)
@@ -355,6 +399,7 @@ func (m *Manager) Reconcile(desired []Desired) {
 	ownedIDs, err := ownedConfigIDs(m.confDir)
 	if err != nil {
 		logger.Warning("amneziawgkern: listing owned configs: ", err)
+		problems = append(problems, err)
 	}
 	for _, id := range ownedIDs {
 		if _, ok := want[id]; ok {
@@ -363,17 +408,25 @@ func (m *Manager) Reconcile(desired []Desired) {
 		if _, ok := attempted[id]; ok {
 			continue
 		}
+		if owned, found, err := readOwnedConfig(m.confDir, id); err == nil && found &&
+			(m.bandwidth != nil) != isBandwidthOwnedConfig(owned, ownedInterfaceName(id)) {
+			continue
+		}
 		if err := m.teardown(id); err != nil {
 			logger.Warning("amneziawgkern: stopping recovered inbound ", id, ": ", err)
+			problems = append(problems, fmt.Errorf("stop recovered inbound %d: %w", id, err))
 			continue
 		}
 		logger.Info("amneziawgkern: stopped recovered kernel interface for inbound ", id)
 	}
+	lookup := m.bandwidthAccountLookup()
 	for _, d := range desired {
-		if err := m.ensureLocked(d); err != nil {
+		if err := m.ensureLocked(d, lookup); err != nil {
 			logger.Warning("amneziawgkern: ensure inbound ", d.Instance.Id, ": ", err)
+			problems = append(problems, fmt.Errorf("start inbound %d: %w", d.Instance.Id, err))
 		}
 	}
+	return errors.Join(problems...)
 }
 
 // Remove tears down one inbound's interface and forgets it.
@@ -440,7 +493,8 @@ func (m *Manager) TrafficStateFor(id int) (TrafficInterfaceState, bool) {
 	}
 	return TrafficInterfaceState{
 		Name: cur.spec.name, Generation: cur.trafficGeneration,
-		Adopted: cur.trafficBaselinePending,
+		Adopted:    cur.trafficBaselinePending,
+		PeerEmails: maps.Clone(cur.bandwidthPeerEmails), PeerTrafficIDs: maps.Clone(cur.bandwidthPeerTrafficIDs),
 	}, true
 }
 
@@ -461,11 +515,17 @@ func (m *Manager) PrimeAdoptedTrafficBaseline(id int, generation uint64, stats [
 // private config, refusing a live link the panel cannot prove is its own.
 func (m *Manager) teardown(id int) error {
 	name := ownedInterfaceName(id)
+	cur, isManaged := m.ifaces[id]
+	if isManaged && cur.bandwidthGate != nil {
+		cur.bandwidthGate.Block()
+	}
 	owned, found, err := readOwnedConfig(m.confDir, id)
 	if err != nil {
 		return err
 	}
-	_, isManaged := m.ifaces[id]
+	if found && (m.bandwidth != nil) != isBandwidthOwnedConfig(owned, name) {
+		return fmt.Errorf("amneziawgkern: refusing to stop %s under a different management mode", name)
+	}
 	if !found && !isManaged {
 		if m.host.linkExists(name) {
 			return fmt.Errorf("amneziawgkern: refusing to stop %s without an owned config", name)
@@ -473,19 +533,58 @@ func (m *Manager) teardown(id int) error {
 		return nil
 	}
 	if m.host.linkExists(name) {
-		if found {
+		var downErr error
+		if m.bandwidth != nil {
+			if !found {
+				return fmt.Errorf("amneziawgkern: refusing to stop %s without an owned config", name)
+			}
+			iface, err := m.bandwidth.lookup(name)
+			if err != nil {
+				return fmt.Errorf("amneziawgkern: inspect interface %s before removal: %w", name, err)
+			}
+			if isManaged && cur.bandwidthIndex != 0 && cur.bandwidthIndex != iface.Index {
+				return fmt.Errorf("amneziawgkern: refusing to remove replaced interface %s", name)
+			}
+			allowKeyless := isManaged && cur.bandwidthIndex == iface.Index && cur.bandwidthGate == nil && iface.Flags&net.FlagUp == 0
+			if err := m.verifyLiveInterfaceKey(name, owned, allowKeyless); err != nil {
+				return err
+			}
+			if iface.Flags&net.FlagUp != 0 {
+				if out, err := m.host.run("", "ip", "link", "set", "dev", name, "down"); err != nil {
+					downErr = fmt.Errorf("amneziawgkern: ip link set %s down: %w (%s)", name, err, out)
+				}
+			}
+		} else if found {
 			if err := m.verifyLiveInterface(name, owned); err != nil {
 				return err
 			}
 		}
 		if err := m.deleteLink(name); err != nil {
-			return err
+			return errors.Join(downErr, err)
 		}
 	}
-	if out, err := m.host.run(natTransaction(id, ""), "nft", "-f", "-"); err != nil {
-		return fmt.Errorf("amneziawgkern: removing NAT for %s: %w (%s)", name, err, out)
+	if isManaged && cur.bandwidthGate != nil {
+		if err := cur.bandwidthGate.Close(); err != nil {
+			return fmt.Errorf("amneziawgkern: clear bandwidth gate for %s: %w", name, err)
+		}
+	} else if m.bandwidth != nil && found {
+		nat, _ := bandwidthNATState(owned)
+		if err := m.bandwidth.removeStale(name, nat.GateGeneration); err != nil {
+			return fmt.Errorf("amneziawgkern: clear recovered bandwidth gate for %s: %w", name, err)
+		}
 	}
-	m.removeForwardRules(name)
+	if m.bandwidth != nil {
+		if nat, ok := bandwidthNATState(owned); ok {
+			if err := m.removeBandwidthEgress(id, name, nat); err != nil {
+				return err
+			}
+		}
+	} else {
+		if out, err := m.host.run(natTransaction(id, ""), "nft", "-f", "-"); err != nil {
+			return fmt.Errorf("amneziawgkern: removing NAT for %s: %w (%s)", name, err, out)
+		}
+		m.removeForwardRules(name)
+	}
 	if found {
 		if err := os.Remove(ConfPathIn(m.confDir, name)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("amneziawgkern: removing private config %s: %w", name, err)

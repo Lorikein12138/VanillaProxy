@@ -136,6 +136,7 @@ func run(root, outDir string) error {
 		{
 			Path:        resolveRel(root, "internal/tuic"),
 			StructAllow: setOf("TuicServerSettings", "TuicClientSettings"),
+			AliasAllow:  setOf(),
 		},
 	}
 

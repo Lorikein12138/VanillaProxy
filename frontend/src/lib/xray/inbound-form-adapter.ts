@@ -1,4 +1,5 @@
 import { resolveTuicServerSettings } from '@/lib/tuic';
+import { stripProxyBandwidthClientIds } from '@/models/dbinbound';
 import type {
   InboundFormValues,
   ShareAddrStrategy,
@@ -173,7 +174,15 @@ function stripTlsCertUseFile(stream: Record<string, unknown>): void {
 
 export function rawInboundToFormValues(row: RawInboundRow): InboundFormValues {
   const protocol = (row.protocol || 'vless') as InboundSettings['protocol'];
-  const rawSettings = coerceJsonObject(row.settings);
+  let rawSettings = coerceJsonObject(row.settings);
+  if (row.nodeId) rawSettings = stripProxyBandwidthClientIds(protocol, rawSettings);
+  if (
+    (protocol === 'http' || protocol === 'mixed') &&
+    rawSettings.accounts == null &&
+    Array.isArray(rawSettings.users)
+  ) {
+    rawSettings = { ...rawSettings, accounts: rawSettings.users };
+  }
   const settings = (
     protocol === 'tuic'
       ? { clients: rawSettings.clients, server: resolveTuicServerSettings(rawSettings) }

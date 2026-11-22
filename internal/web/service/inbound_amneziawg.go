@@ -16,6 +16,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/tuic"
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
+	webruntime "github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
+	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 )
 
 // DesiredAmneziaWGInstances derives the AmneziaWG interfaces this panel
@@ -34,25 +36,47 @@ func (s *InboundService) DesiredAmneziaWGInstances() ([]amneziawg.Instance, erro
 	if err != nil {
 		return nil, err
 	}
+	return desiredAmneziaWGInstances(inbounds)
+}
+
+func desiredAmneziaWGInstances(inbounds []*model.Inbound) ([]amneziawg.Instance, error) {
 	if len(inbounds) == 0 {
 		return nil, nil
 	}
 
 	instances := make([]amneziawg.Instance, 0, len(inbounds))
+	bandwidth := activeBandwidthNode.Load() != nil
 	for _, ib := range inbounds {
+		if !ib.Enable || ib.NodeID != nil {
+			continue
+		}
 		inst, ok := amneziawg.InstanceFromInbound(ib)
 		if !ok {
+			continue
+		}
+		if bandwidth && inst.KernelMode && webruntime.ValidateBandwidthInbound(ib) != nil {
+			logger.Warningf("Bandwidth-managed kernel AmneziaWG skipped incompatible inbound %q", ib.Tag)
 			continue
 		}
 		instances = append(instances, inst)
 	}
 	emails := make([]string, 0)
+	managedKernel := false
 	for _, inst := range instances {
+		managedKernel = managedKernel || (bandwidth && inst.KernelMode)
 		for _, e := range inst.Peers {
 			emails = append(emails, e.Email)
 		}
 	}
-	disabled, err := trafficDisabledEmails(db, emails)
+	db := database.GetDB()
+	var disabled map[string]struct{}
+	var trafficIDs map[string]int
+	var err error
+	if managedKernel {
+		disabled, trafficIDs, err = managedAmneziaWGTrafficRows(db, emails)
+	} else {
+		disabled, err = trafficDisabledEmails(db, emails)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -61,6 +85,9 @@ func (s *InboundService) DesiredAmneziaWGInstances() ([]amneziawg.Instance, erro
 		kept := make([]amneziawg.Peer, 0, len(inst.Peers))
 		for _, e := range inst.Peers {
 			if _, off := disabled[e.Email]; !off {
+				if inst.KernelMode {
+					e.TrafficID = trafficIDs[e.Email]
+				}
 				kept = append(kept, e)
 			}
 		}
@@ -70,6 +97,24 @@ func (s *InboundService) DesiredAmneziaWGInstances() ([]amneziawg.Instance, erro
 		}
 	}
 	return served, nil
+}
+
+func managedAmneziaWGTrafficRows(db *gorm.DB, emails []string) (map[string]struct{}, map[string]int, error) {
+	disabled := make(map[string]struct{})
+	ids := make(map[string]int)
+	for _, batch := range chunkStrings(uniqueNonEmptyStrings(emails), sqlInChunk) {
+		var rows []xray.ClientTraffic
+		if err := db.Select("id", "email", "enable").Where("email IN ?", batch).Find(&rows).Error; err != nil {
+			return nil, nil, err
+		}
+		for _, row := range rows {
+			if !row.Enable {
+				disabled[row.Email] = struct{}{}
+			}
+			ids[row.Email] = row.Id
+		}
+	}
+	return disabled, ids, nil
 }
 
 // applyLocalAmneziaWG pushes a single local AmneziaWG inbound's current peer

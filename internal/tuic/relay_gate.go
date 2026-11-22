@@ -94,6 +94,20 @@ func (g *RelayGate) ReadyFor(owner int) bool {
 	return g.ready && g.owner == owner
 }
 
+func (g *RelayGate) readyForBandwidth(owner int, clients bandwidthClients) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.ready || g.paused || g.owner != owner || len(g.accounts) != len(clients) {
+		return false
+	}
+	for _, client := range clients {
+		if _, present := g.accounts[client.email]; !present {
+			return false
+		}
+	}
+	return true
+}
+
 func (g *RelayGate) Invalidate(owner int) {
 	g.mu.Lock()
 	g.owner, g.ready, g.accounts = owner, false, nil

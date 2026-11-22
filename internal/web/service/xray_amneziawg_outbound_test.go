@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
@@ -144,11 +145,18 @@ func TestTransformAmneziaWGOutbounds_NoopWithoutAWG(t *testing.T) {
 func TestCheckXrayConfig_AcceptsValidAWGOutbound(t *testing.T) {
 	// A syntactically valid AWG outbound must pass panel-side validation --
 	// the Xray-core loader would reject the unknown protocol outright.
+	if err := (&XraySettingService{}).CheckXrayConfig(validAWGOutboundTemplate(t)); err != nil {
+		t.Fatalf("valid amneziawg outbound rejected: %v", err)
+	}
+}
+
+func validAWGOutboundTemplate(t *testing.T) string {
+	t.Helper()
 	priv, pub, err := wgKeypairForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	template := `{
+	return `{
 		"outbounds": [{
 			"protocol": "amneziawg",
 			"tag": "awg-hop",
@@ -167,9 +175,34 @@ func TestCheckXrayConfig_AcceptsValidAWGOutbound(t *testing.T) {
 			}
 		}]
 	}`
+}
+
+func TestBandwidthManagedTemplateSaveRejectsAWGOutbound(t *testing.T) {
+	setupConflictDB(t)
 	svc := &XraySettingService{}
-	if err := svc.CheckXrayConfig(template); err != nil {
-		t.Fatalf("valid amneziawg outbound rejected: %v", err)
+	template := validAWGOutboundTemplate(t)
+	if err := svc.SaveXraySetting(template); err != nil {
+		t.Fatalf("stock template rejected valid AWG outbound: %v", err)
+	}
+	const ordinary = `{"outbounds":[{"protocol":"freedom","tag":"direct"}]}`
+	if err := svc.SaveXraySetting(ordinary); err != nil {
+		t.Fatal(err)
+	}
+	before, err := svc.GetXrayConfigTemplate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := activeBandwidthNode.Swap(&managedBandwidthNode{})
+	t.Cleanup(func() { activeBandwidthNode.Store(restore) })
+	if err := svc.SaveXraySetting(template); err == nil || !strings.Contains(err.Error(), "does not support AmneziaWG outbounds") {
+		t.Fatalf("managed Xray template did not reject AWG outbound: %v", err)
+	}
+	after, err := svc.GetXrayConfigTemplate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("rejected template edit changed the stored configuration")
 	}
 }
 

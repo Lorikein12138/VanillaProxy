@@ -790,6 +790,21 @@
     "clients": {
       "tabBasics": "Основні",
       "tabCredentials": "Облікові дані",
+      "bandwidth": {
+        "tab": "Bandwidth",
+        "total": "Total bandwidth cap",
+        "totalHint": "Set to 0 to inherit the startup quota. The total cap is shared across nodes.",
+        "nodes": "Node bandwidth caps",
+        "nodeExceedsTotal": "A node bandwidth cap cannot exceed the total bandwidth cap.",
+        "nodeHint": "Leave a node blank to inherit its default. Set it to 0 to remove its extra cap.",
+        "nodeVia": "Node {id} via {name}",
+        "noNodes": "No nodes are associated with the selected inbounds.",
+        "inherit": "Inherit",
+        "local": "Local panel",
+        "unavailable": "This client is outside the running bandwidth limiter. The policy can still be saved.",
+        "loadError": "Could not load the bandwidth policy.",
+        "saveError": "Could not save the bandwidth policy."
+      },
       "tabLinks": "Посилання",
       "wireguardConfig": "Конфігурація WireGuard",
       "config": "Конфігурація",

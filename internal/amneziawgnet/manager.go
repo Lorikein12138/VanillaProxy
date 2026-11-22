@@ -1,6 +1,7 @@
 package amneziawgnet
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"os"
@@ -52,6 +53,8 @@ type managed struct {
 	inst         amneziawg.Instance
 	structFP     string
 	uapiConfig   string
+	bandwidthIDs map[string]string
+	logger       *device.Logger
 }
 
 func (m *managed) lookupPeer(addr netip.Addr) (amneziawg.Peer, bool) {
@@ -88,8 +91,14 @@ func (m *managed) close() {
 // caller only needs to keep calling Ensure/Reconcile with fresh Instance
 // data; it doesn't need to know relay.go exists at all.
 type Manager struct {
-	mu     sync.Mutex
-	ifaces map[int]*managed
+	mu             sync.Mutex
+	ifaces         map[int]*managed
+	started        bool
+	bandwidthWait  func(context.Context, string, int) error
+	resolveAccount func(string) (string, bool)
+	// Managed starts require a relay with strict authentication and exact
+	// UDP association binding.
+	managedRelay func(amneziawg.Instance) (SocksRelay, error)
 }
 
 var (
@@ -100,7 +109,7 @@ var (
 // GetManager returns the process-wide embedded-AmneziaWG manager singleton.
 func GetManager() *Manager {
 	managerOnce.Do(func() {
-		manager = &Manager{ifaces: map[int]*managed{}}
+		manager = &Manager{ifaces: map[int]*managed{}, managedRelay: boundSocksRelayForInstance}
 	})
 	return manager
 }
@@ -111,7 +120,7 @@ func GetManager() *Manager {
 func (m *Manager) Ensure(d Desired) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.ensureLocked(d)
+	return m.ensureLocked(d, nil)
 }
 
 // ensureLocked decides between three actions: nothing changed since the
@@ -129,12 +138,10 @@ func (m *Manager) Ensure(d Desired) error {
 // Device in place via IpcSet); or the interface's own address(es)/effective
 // MTU changed -- S4 counts, the default MTU derives from it (these are fixed
 // at netstack-construction time, so the only option is closing the old
-// Device and building a fresh one).
-func (m *Manager) ensureLocked(d Desired) error {
+// Device and building a fresh one). Bandwidth-managed devices also rebuild
+// on changes to their immutable bindings or peer and relay configuration.
+func (m *Manager) ensureLocked(d Desired, clientIDs map[string]string) (err error) {
 	inst, opts := d.Instance, d.Options
-	if opts.Logger == nil {
-		opts.Logger = verboseLoggerIfEnabled(inst.Id)
-	}
 	structFP := addressFingerprint(inst)
 
 	cur, exists := m.ifaces[inst.Id]
@@ -148,7 +155,57 @@ func (m *Manager) ensureLocked(d Desired) error {
 		oldInst = cur.inst
 	}
 
-	if exists && cur.structFP == structFP {
+	bandwidthManaged := m.bandwidthWait != nil
+	if clientIDs != nil && (!bandwidthManaged || m.resolveAccount != nil) {
+		return fmt.Errorf("amneziawgnet: automatic bandwidth is not configured")
+	}
+	if exists && bandwidthManaged {
+		defer func() {
+			if err == nil {
+				return
+			}
+			// Validation can fail while the old interface is still running.
+			// A failed replacement can leave aliases after closing it.
+			if live, ok := m.ifaces[inst.Id]; ok {
+				live.close()
+				delete(m.ifaces, inst.Id)
+			}
+			applyV6Aliases(diffV6Aliases(oldInst, amneziawg.Instance{}))
+		}()
+	}
+
+	if opts.Bandwidth != nil {
+		return fmt.Errorf("amneziawgnet: configure manager bandwidth with ConfigureBandwidth")
+	}
+	var relay SocksRelay
+	var bandwidthIDs map[string]string
+	if bandwidthManaged {
+		inst = cloneBandwidthInstance(inst)
+		opts.Bandwidth, err = m.prepareBandwidth(inst, clientIDs)
+		if err != nil {
+			return err
+		}
+		bandwidthIDs = opts.Bandwidth.ClientIDs
+		if m.managedRelay == nil {
+			return fmt.Errorf("amneziawgnet: strict bandwidth relay is unavailable")
+		}
+		relay, err = m.managedRelay(inst)
+		if err != nil {
+			return err
+		}
+		if !relay.RequireBoundUDP {
+			return fmt.Errorf("amneziawgnet: bandwidth requires a bound SOCKS relay")
+		}
+		conf, err := buildUAPIConfig(inst, opts)
+		if err != nil {
+			return fmt.Errorf("amneziawgnet: %w", err)
+		}
+		if exists && matchesBandwidthDevice(cur, inst, opts, conf, relay) {
+			return nil
+		}
+	}
+
+	if exists && !bandwidthManaged && cur.structFP == structFP {
 		conf, err := buildUAPIConfig(inst, opts)
 		if err != nil {
 			return fmt.Errorf("amneziawgnet: %w", err)
@@ -189,12 +246,18 @@ func (m *Manager) ensureLocked(d Desired) error {
 		cur.close()
 		delete(m.ifaces, inst.Id)
 	}
+	configuredLogger := opts.Logger
+	if opts.Logger == nil {
+		opts.Logger = verboseLoggerIfEnabled(inst.Id)
+	}
 	dev, err := newUnconfiguredDevice(inst, opts)
 	if err != nil {
 		return err
 	}
 
-	relay := socksRelayForInstance(inst)
+	if !bandwidthManaged {
+		relay = socksRelayForInstance(inst)
+	}
 	udpRelay := NewUDPRelay(relay, dev.Stack)
 	portForwards := NewPortForwardSet(dev.Stack, inst.Id)
 	next := &managed{
@@ -203,8 +266,15 @@ func (m *Manager) ensureLocked(d Desired) error {
 		portForwards: portForwards,
 		inst:         inst,
 		structFP:     structFP,
+		bandwidthIDs: bandwidthIDs,
+		logger:       configuredLogger,
 	}
-	next.peers.Store(NewPeerIndex(inst.Peers))
+	peers := inst.Peers
+	if bandwidthManaged {
+		// Keep the managed snapshot private from PeerIndex.Lookup callers.
+		peers = cloneBandwidthPeers(peers)
+	}
+	next.peers.Store(NewPeerIndex(peers))
 	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
 		srcAddrPort, err := netip.ParseAddrPort(conn.RemoteAddr().String())
 		if err != nil {
@@ -240,8 +310,11 @@ func (m *Manager) ensureLocked(d Desired) error {
 	conf, _ := buildUAPIConfig(inst, opts)
 	next.uapiConfig = conf
 	m.ifaces[inst.Id] = next
+	m.started = true
 	applyV6Aliases(diffV6Aliases(oldInst, inst))
-	portForwards.Reconcile(inst)
+	if !bandwidthManaged {
+		portForwards.Reconcile(inst)
+	}
 	logger.Infof("amneziawgnet: started embedded interface %s for inbound %d", inst.InterfaceName, inst.Id)
 	return nil
 }
@@ -255,6 +328,15 @@ func socksRelayForInstance(inst amneziawg.Instance) SocksRelay {
 		Addr:     fmt.Sprintf("127.0.0.1:%d", SOCKSPortForInbound(inst.Id)),
 		Password: SocksPassword(),
 	}
+}
+
+func boundSocksRelayForInstance(inst amneziawg.Instance) (SocksRelay, error) {
+	relay := socksRelayForInstance(inst)
+	relay.RequireBoundUDP = true
+	if err := relay.validateBoundRelay(); err != nil {
+		return SocksRelay{}, err
+	}
+	return relay, nil
 }
 
 // addressFingerprint captures Bind/netstack identity IpcSet cannot change.
@@ -276,6 +358,15 @@ func (m *Manager) Reconcile(desired []Desired) {
 	for _, d := range desired {
 		want[d.Instance.Id] = struct{}{}
 	}
+	m.removeUndesiredLocked(want)
+	for _, d := range desired {
+		if err := m.ensureLocked(d, nil); err != nil {
+			logger.Warningf("amneziawgnet: reconcile failed for inbound %d: %v", d.Instance.Id, err)
+		}
+	}
+}
+
+func (m *Manager) removeUndesiredLocked(want map[int]struct{}) {
 	for id, cur := range m.ifaces {
 		if _, ok := want[id]; ok {
 			continue
@@ -284,11 +375,6 @@ func (m *Manager) Reconcile(desired []Desired) {
 		cur.close()
 		delete(m.ifaces, id)
 		logger.Infof("amneziawgnet: stopped embedded interface for removed inbound %d", id)
-	}
-	for _, d := range desired {
-		if err := m.ensureLocked(d); err != nil {
-			logger.Warningf("amneziawgnet: reconcile failed for inbound %d: %v", d.Instance.Id, err)
-		}
 	}
 }
 

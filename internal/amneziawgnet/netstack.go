@@ -43,25 +43,36 @@ type stackTun struct {
 	closeMu        sync.Mutex
 	closed         bool
 	mtu            int
+	bandwidth      *tunBandwidth
 }
 
 // createNetTUNWithStack builds a gVisor-backed tun.Device for localAddresses
 // and returns underlying *stack.Stack to attach forwarders.
 func createNetTUNWithStack(localAddresses []netip.Addr, mtu int) (awgtun.Device, *stack.Stack, error) {
+	return createNetTUNWithBandwidth(localAddresses, mtu, nil)
+}
+
+func createNetTUNWithBandwidth(localAddresses []netip.Addr, mtu int, bandwidth *tunBandwidth) (awgtun.Device, *stack.Stack, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
 		// HandleLocal stays false so non-local destinations reach forwarder.
 		HandleLocal: false,
 	}
+	queueDepth := tunQueueDepth
+	if bandwidth != nil {
+		queueDepth = bandwidthPacketsPerDevice
+	}
 	dev := &stackTun{
-		// tunQueueDepth buffers channel.New and incomingPacket for pipelining.
-		ep:             channel.New(tunQueueDepth, uint32(mtu), ""),
-		stack:          stack.New(opts),
-		events:         make(chan awgtun.Event, 10),
-		incomingPacket: make(chan *buffer.View, tunQueueDepth),
-		done:           make(chan struct{}),
-		mtu:            mtu,
+		ep:        channel.New(queueDepth, uint32(mtu), ""),
+		stack:     stack.New(opts),
+		events:    make(chan awgtun.Event, 10),
+		done:      make(chan struct{}),
+		mtu:       mtu,
+		bandwidth: bandwidth,
+	}
+	if bandwidth == nil {
+		dev.incomingPacket = make(chan *buffer.View, tunQueueDepth)
 	}
 	sackEnabledOpt := tcpip.TCPSACKEnabled(true)
 	if err := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt); err != nil {
@@ -76,8 +87,12 @@ func createNetTUNWithStack(localAddresses []netip.Addr, mtu int) (awgtun.Device,
 			return nil, nil, fmt.Errorf("amneziawgnet: tune TCP receive buffer: %s", err)
 		}
 	}
+	if bandwidth != nil {
+		bandwidth.start(dev)
+	}
 	dev.notifyHandle = dev.ep.AddNotify(dev)
 	if err := dev.stack.CreateNIC(1, dev.ep); err != nil {
+		dev.Close()
 		return nil, nil, fmt.Errorf("amneziawgnet: CreateNIC: %s", err)
 	}
 
@@ -99,6 +114,7 @@ func createNetTUNWithStack(localAddresses []netip.Addr, mtu int) (awgtun.Device,
 			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
 		}
 		if err := dev.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{}); err != nil {
+			dev.Close()
 			return nil, nil, fmt.Errorf("amneziawgnet: AddProtocolAddress(%v): %s", ip, err)
 		}
 	}
@@ -121,6 +137,9 @@ func (t *stackTun) BatchSize() int              { return 1 }
 // Read drains incomingPacket into buf, supporting batched reads. Each view is
 // released once copied out, so the download path reuses gVisor's pooled chunks.
 func (t *stackTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
+	if t.bandwidth != nil {
+		return t.bandwidth.read(buf, sizes, offset, t.done)
+	}
 	var view *buffer.View
 	select {
 	case <-t.done:
@@ -159,19 +178,29 @@ func (t *stackTun) Write(buf [][]byte, offset int) (int, error) {
 		if len(packet) == 0 {
 			continue
 		}
-		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
-		switch packet[0] >> 4 {
-		case 4:
-			t.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
-		case 6:
-			t.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
-		default:
-			pkb.DecRef()
-			return 0, syscall.EAFNOSUPPORT
+		if t.bandwidth != nil {
+			t.bandwidth.enqueue(packet, nil, true)
+			continue
 		}
-		pkb.DecRef()
+		if err := t.inject(packet[0]>>4, buffer.MakeWithData(packet)); err != nil {
+			return 0, err
+		}
 	}
 	return len(buf), nil
+}
+
+func (t *stackTun) inject(version byte, payload buffer.Buffer) error {
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: payload})
+	defer pkb.DecRef()
+	switch version {
+	case 4:
+		t.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
+	case 6:
+		t.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
+	default:
+		return syscall.EAFNOSUPPORT
+	}
+	return nil
 }
 
 // WriteNotify runs on gVisor dispatch while Close tears the endpoint down,
@@ -190,6 +219,11 @@ func (t *stackTun) WriteNotify() {
 	}
 	view := pkt.ToView()
 	pkt.DecRef()
+
+	if t.bandwidth != nil {
+		t.bandwidth.enqueue(view.AsSlice(), view, false)
+		return
+	}
 
 	// Select against done so racing dispatch abandons packet on close
 	// without blocking Close or panicking on closed channel.
@@ -210,6 +244,9 @@ func (t *stackTun) Close() error {
 	close(t.done)
 	t.closeMu.Unlock()
 
+	if t.bandwidth != nil {
+		t.bandwidth.close()
+	}
 	t.stack.RemoveNIC(1)
 	t.stack.Close()
 	t.ep.RemoveNotify(t.notifyHandle)

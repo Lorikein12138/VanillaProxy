@@ -14,6 +14,18 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
+func TestWireInboundDropsLocalProxyBandwidthBindings(t *testing.T) {
+	inbound := model.Inbound{Protocol: model.Mixed, Settings: `{"auth":"password","udp":true,"users":[{"user":"shadowed","pass":"legacy","bandwidthClientId":7}],"accounts":[{"user":"active","pass":"secret","bandwidthClientId":8}]}`}
+	payload := wireInbound(&inbound, 1).Get("settings")
+	const want = `{"accounts":[{"pass":"secret","user":"active"}],"auth":"password","udp":true,"users":[{"pass":"legacy","user":"shadowed"}]}`
+	if payload != want {
+		t.Fatalf("unexpected account projection for node push: %s", payload)
+	}
+	if !strings.Contains(inbound.Settings, "bandwidthClientId") {
+		t.Fatal("building a node payload mutated its source")
+	}
+}
+
 // TestRemoteDo_RejectsOversizeResponse: a node streaming a body larger than
 // maxRemoteResponseBytes must error out instead of the master buffering it
 // unbounded.

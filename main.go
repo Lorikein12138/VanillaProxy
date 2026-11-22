@@ -18,6 +18,7 @@ import (
 	"syscall"
 	_ "unsafe"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthruntime"
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/crypto/nodetoken"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
@@ -30,6 +31,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/tgbot"
+	"github.com/mhsanaei/3x-ui/v3/internal/xraybandwidthchild"
 
 	"github.com/joho/godotenv"
 	"github.com/op/go-logging"
@@ -73,7 +75,7 @@ func initNodeTokenCrypto() error {
 }
 
 // runWebServer initializes and starts the web server for the 3x-ui panel.
-func runWebServer() {
+func runWebServer() error {
 	log.Printf("Starting %v %v", config.GetName(), config.GetPanelVersion())
 
 	switch config.GetLogLevel() {
@@ -93,6 +95,11 @@ func runWebServer() {
 
 	_ = godotenv.Load()
 
+	bandwidthConfig, err := bandwidthruntime.LoadPanelConfig(os.Getenv(bandwidthruntime.PanelConfigEnv))
+	if err != nil {
+		return fmt.Errorf("load bandwidth configuration: %w", err)
+	}
+
 	for _, line := range sys.ApplyMemoryTuning() {
 		logger.Info(line)
 	}
@@ -110,7 +117,7 @@ func runWebServer() {
 		log.Fatalf("Error initializing node-token encryption: %v", err)
 	}
 
-	err := database.InitDB(config.GetDBPath())
+	err = database.InitDB(config.GetDBPath())
 	if err != nil {
 		log.Fatalf("Error initializing database: %v", err)
 	}
@@ -124,32 +131,56 @@ func runWebServer() {
 		log.Printf("No panel user existed, so one was generated. Username: %s  Password: %s  (shown once; change it in Panel Settings)", username, password)
 	}
 
-	server := web.NewServer(sub.NewLinkProvider())
+	bandwidthPanel, err := bandwidthruntime.StartPanelRuntimeWithPolicy(bandwidthConfig, service.ClientBandwidthService{})
+	if err != nil {
+		return fmt.Errorf("start bandwidth runtime: %w", err)
+	}
+	defer func() {
+		if err := bandwidthPanel.Close(); err != nil {
+			logger.Error("Bandwidth runtime shutdown failed:", err)
+		}
+	}()
+
+	server := web.NewServerWithBandwidth(sub.NewLinkProvider(), bandwidthPanel)
 	global.SetWebServer(server)
 	err = server.Start()
 	if err != nil {
-		log.Fatalf("Error starting web server: %v", err)
+		return fmt.Errorf("start web server: %w", err)
 	}
 
 	sub.SetDistFS(web.EmbeddedDist())
 	subServer := sub.NewServer()
+	webStarted, subStarted := true, false
+	defer func() {
+		tgbot.StopBot()
+		if webStarted {
+			if err := server.Stop(); err != nil {
+				logger.Error("Server shutdown failed:", err)
+			}
+		}
+		if subStarted {
+			_ = subServer.Stop()
+		}
+	}()
 	global.SetSubServer(subServer)
 	err = subServer.Start()
 	if err != nil {
-		log.Fatalf("Error starting sub server: %v", err)
+		return fmt.Errorf("start sub server: %w", err)
 	}
+	subStarted = true
 
 	sigCh := make(chan os.Signal, 8)
 	// Trap shutdown signals
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, sys.SIGUSR1, os.Interrupt)
+	defer signal.Stop(sigCh)
 	global.SetRestartHook(func() {
 		select {
 		case sigCh <- syscall.SIGHUP:
 		default:
 		}
 	})
+	defer global.SetRestartHook(nil)
 
-	var stopTunnelHealthMonitor context.CancelFunc
 	monitorCfg := tunnelmonitor.ConfigFromEnv()
 	if monitorCfg.Enabled {
 		if monitorCfg.ProxyURL == "" {
@@ -157,11 +188,11 @@ func runWebServer() {
 		}
 
 		monitorCtx, cancel := context.WithCancel(context.Background())
-		stopTunnelHealthMonitor = cancel
+		defer cancel()
 
 		monitor, err := tunnelmonitor.New(monitorCfg, func(_ context.Context) error {
 			logger.Warning("Tunnel health monitor threshold reached, restarting xray-core")
-			return server.RestartXray()
+			return (&service.XrayService{}).RestartXray(true)
 		})
 		if err != nil {
 			logger.Warning("Tunnel health monitor disabled: ", err)
@@ -177,20 +208,23 @@ func runWebServer() {
 			logger.Info("Received SIGHUP signal. Restarting servers...")
 
 			err := server.StopPanelOnly()
+			webStarted = false
 			if err != nil {
 				logger.Debug("Error stopping web server:", err)
 			}
 			err = subServer.Stop()
+			subStarted = false
 			if err != nil {
 				logger.Debug("Error stopping sub server:", err)
 			}
 
-			server = web.NewServer(sub.NewLinkProvider())
+			server = web.NewServerWithBandwidth(sub.NewLinkProvider(), bandwidthPanel)
 			global.SetWebServer(server)
 			err = server.StartPanelOnly()
 			if err != nil {
-				log.Fatalf("Error restarting web server: %v", err)
+				return fmt.Errorf("restart web server: %w", err)
 			}
+			webStarted = true
 			log.Println("Web server restarted successfully.")
 
 			sub.SetDistFS(web.EmbeddedDist())
@@ -198,8 +232,9 @@ func runWebServer() {
 			global.SetSubServer(subServer)
 			err = subServer.Start()
 			if err != nil {
-				log.Fatalf("Error restarting sub server: %v", err)
+				return fmt.Errorf("restart sub server: %w", err)
 			}
+			subStarted = true
 			log.Println("Sub server restarted successfully.")
 		case sys.SIGUSR1:
 			logger.Info("Received USR1 signal, restarting xray-core...")
@@ -209,20 +244,8 @@ func runWebServer() {
 			}
 
 		default:
-			if stopTunnelHealthMonitor != nil {
-				stopTunnelHealthMonitor()
-			}
-
-			// --- FIX FOR TELEGRAM BOT CONFLICT (409) on full shutdown ---
-			tgbot.StopBot()
-			// ------------------------------------------------------------
-
-			if err := server.Stop(); err != nil {
-				logger.Error("Server shutdown failed:", err)
-			}
-			_ = subServer.Stop()
 			log.Println("Shutting down servers.")
-			return
+			return nil
 		}
 	}
 }
@@ -583,10 +606,22 @@ func loadServiceEnvFile() {
 // main is the entry point of the 3x-ui application.
 // It parses command-line arguments to run the web server, migrate database, or update settings.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == xraybandwidthchild.Command {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := xraybandwidthchild.Run(ctx, os.Args[2:], os.Stdin)
+		stop()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	loadServiceEnvFile()
 
 	if len(os.Args) < 2 {
-		runWebServer()
+		if err := runWebServer(); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 
@@ -666,7 +701,9 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-		runWebServer()
+		if err := runWebServer(); err != nil {
+			log.Fatal(err)
+		}
 	case "install-awg-kernel":
 		installAmneziaWGKernelModule()
 	case "migrate":

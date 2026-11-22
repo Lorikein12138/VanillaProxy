@@ -224,9 +224,13 @@ func canonicalizeClientTraffic(tx *gorm.DB, traffics []*xray.ClientTraffic) ([]*
 			continue
 		}
 		email := traffic.Email
-		if traffic.TuicTrafficID > 0 {
+		trafficID := traffic.TuicTrafficID
+		if traffic.AWGTrafficID > 0 {
+			trafficID = traffic.AWGTrafficID
+		}
+		if trafficID > 0 {
 			var owner xray.ClientTraffic
-			err := tx.Select("email").Where("id = ?", traffic.TuicTrafficID).Take(&owner).Error
+			err := tx.Select("email").Where("id = ?", trafficID).Take(&owner).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				continue
 			}

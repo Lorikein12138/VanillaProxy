@@ -1,6 +1,7 @@
 package amneziawgnet
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,7 +49,12 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 	if bin == "" {
 		t.Skip("set XRAY_E2E_BINARY to an xray binary to run this test")
 	}
+	t.Run("stock", func(t *testing.T) { testSocksRelayAgainstRealXray(t, bin, false) })
+	t.Run("bound", func(t *testing.T) { testSocksRelayAgainstRealXray(t, bin, true) })
+}
 
+func testSocksRelayAgainstRealXray(t *testing.T, bin string, requireBoundUDP bool) {
+	t.Helper()
 	localIP, ok := firstNonLoopbackIPv4()
 	if !ok {
 		t.Skip("no non-loopback IPv4 address available on this host")
@@ -96,7 +103,22 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 			AllowedIPs: []string{"10.204.0.2/32"},
 		}},
 	}
-	dev, err := newUnconfiguredDevice(inst, DeviceOptions{})
+	var opts DeviceOptions
+	var gatedPackets atomic.Int64
+	if requireBoundUDP {
+		const account = "e2e-canonical-account"
+		opts.Bandwidth = &BandwidthOptions{
+			ClientIDs: map[string]string{clientPub: account},
+			Wait: func(_ context.Context, id string, bytes int) error {
+				if id != account || bytes <= 0 {
+					return fmt.Errorf("unexpected bandwidth request for %q of %d bytes", id, bytes)
+				}
+				gatedPackets.Add(1)
+				return nil
+			},
+		}
+	}
+	dev, err := newUnconfiguredDevice(inst, opts)
 	if err != nil {
 		t.Fatalf("newUnconfiguredDevice: %v", err)
 	}
@@ -157,7 +179,7 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 	waitForPort(t, socksPort)
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
-	relay := SocksRelay{Addr: socksAddr, Password: socksPassword}
+	relay := SocksRelay{Addr: socksAddr, Password: socksPassword, RequireBoundUDP: requireBoundUDP}
 	udpRelay := NewUDPRelay(relay, dev.Stack)
 	defer udpRelay.Close()
 
@@ -184,7 +206,7 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 
 	// Configure (IpcSet) must come after both attaches -- see
 	// newUnconfiguredDevice's doc comment.
-	if err := dev.Configure(inst, DeviceOptions{}); err != nil {
+	if err := dev.Configure(inst, opts); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 
@@ -271,6 +293,9 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 	}
 	if gotUDP != udpMsg {
 		t.Fatalf("UDP echo = %q, want %q (xray log follows)\n%s", gotUDP, udpMsg, xrayLog.String())
+	}
+	if requireBoundUDP && gatedPackets.Load() == 0 {
+		t.Fatal("bound relay traffic skipped the bandwidth gate")
 	}
 
 	// Real per-peer stats attribution: stop xray so its log is complete, then

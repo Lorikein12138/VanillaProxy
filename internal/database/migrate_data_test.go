@@ -2,6 +2,7 @@ package database
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -63,7 +64,7 @@ func TestMigrateData_CompositeKeyTableLargerThanBatch(t *testing.T) {
 	}
 }
 
-func TestMigrateData_PreservesFalseDefaultedColumns(t *testing.T) {
+func TestMigrateData_PreservesFalseDefaultedColumnsAndClientIDSequence(t *testing.T) {
 	dsn := os.Getenv("XUI_TEST_PG_DSN")
 	if dsn == "" {
 		t.Skip("set XUI_TEST_PG_DSN to a reachable Postgres to run this test")
@@ -85,6 +86,14 @@ func TestMigrateData_PreservesFalseDefaultedColumns(t *testing.T) {
 		{Email: "off@example.com"},
 	}).Error; err != nil {
 		t.Fatalf("seed clients: %v", err)
+	}
+	const deletedID = 1000
+	deleted := &model.ClientRecord{Id: deletedID, Email: "deleted@example.com"}
+	if err := src.Create(deleted).Error; err != nil {
+		t.Fatalf("seed high client ID: %v", err)
+	}
+	if err := src.Delete(deleted).Error; err != nil {
+		t.Fatalf("delete high client ID: %v", err)
 	}
 	if err := src.Model(&model.ClientRecord{}).Where("email = ?", "off@example.com").
 		Update("enable", false).Error; err != nil {
@@ -135,6 +144,144 @@ func TestMigrateData_PreservesFalseDefaultedColumns(t *testing.T) {
 	}
 	if node.Enable {
 		t.Fatalf("disabled node re-enabled after migration")
+	}
+
+	checkNextID := func(db *gorm.DB, want int) {
+		t.Helper()
+		client := &model.ClientRecord{Email: "generated@example.com"}
+		if err := db.Create(client).Error; err != nil {
+			t.Fatalf("create generated client: %v", err)
+		}
+		if client.Id != want {
+			t.Fatalf("generated client ID = %d, want %d", client.Id, want)
+		}
+		if err := db.Delete(client).Error; err != nil {
+			t.Fatalf("delete generated client: %v", err)
+		}
+	}
+	checkNextID(dst, deletedID+1)
+	if err := resyncPostgresSequences(dst, []any{&model.ClientRecord{}}); err != nil {
+		t.Fatalf("resync on startup: %v", err)
+	}
+	checkNextID(dst, deletedID+2)
+	if err := MigrateData(srcPath, dsn); err != nil {
+		t.Fatalf("repeat MigrateData: %v", err)
+	}
+	checkNextID(dst, deletedID+3)
+
+	exportPath := t.TempDir() + "/export.db"
+	if err := ExportPostgresToSQLite(dsn, exportPath); err != nil {
+		t.Fatalf("ExportPostgresToSQLite: %v", err)
+	}
+	exported, err := gorm.Open(sqlite.Open(exportPath), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		t.Fatalf("open exported SQLite: %v", err)
+	}
+	defer closeGorm(exported)
+	checkNextID(exported, deletedID+4)
+}
+
+func TestSQLiteClientSequencePreservesDeletedIDs(t *testing.T) {
+	src, err := gorm.Open(sqlite.Open(t.TempDir()+"/source.db"), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer closeGorm(src)
+	if seq, err := sqliteClientSequence(src); err != nil || seq != 0 {
+		t.Fatalf("missing sqlite_sequence = %d, %v, want 0", seq, err)
+	}
+	if err := src.AutoMigrate(&model.ClientRecord{}); err != nil {
+		t.Fatalf("create source clients: %v", err)
+	}
+	if seq, err := sqliteClientSequence(src); err != nil || seq != 0 {
+		t.Fatalf("unused client sequence = %d, %v, want 0", seq, err)
+	}
+	const deletedID = 1000
+	client := &model.ClientRecord{Id: deletedID, Email: "deleted@example.com"}
+	if err := src.Create(client).Error; err != nil {
+		t.Fatalf("seed high client ID: %v", err)
+	}
+	if err := src.Delete(client).Error; err != nil {
+		t.Fatalf("delete high client ID: %v", err)
+	}
+	sequence, err := sqliteClientSequence(src)
+	if err != nil || sequence != deletedID {
+		t.Fatalf("sequence after delete = %d, %v, want %d", sequence, err, deletedID)
+	}
+
+	dst, err := gorm.Open(sqlite.Open(t.TempDir()+"/destination.db"), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		t.Fatalf("open destination: %v", err)
+	}
+	defer closeGorm(dst)
+	if err := dst.AutoMigrate(&model.ClientRecord{}); err != nil {
+		t.Fatalf("create destination clients: %v", err)
+	}
+	if err := advanceSQLiteClientSequence(dst, sequence); err != nil {
+		t.Fatalf("initialize destination sequence: %v", err)
+	}
+	first := &model.ClientRecord{Email: "first@example.com"}
+	if err := dst.Create(first).Error; err != nil || first.Id != deletedID+1 {
+		t.Fatalf("first generated client ID = %d, %v, want %d", first.Id, err, deletedID+1)
+	}
+	if err := dst.Delete(first).Error; err != nil {
+		t.Fatalf("delete first generated client: %v", err)
+	}
+	if err := advanceSQLiteClientSequence(dst, sequence); err != nil {
+		t.Fatalf("clamp destination sequence: %v", err)
+	}
+	second := &model.ClientRecord{Email: "second@example.com"}
+	if err := dst.Create(second).Error; err != nil || second.Id != deletedID+2 {
+		t.Fatalf("second generated client ID = %d, %v, want %d", second.Id, err, deletedID+2)
+	}
+}
+
+func TestPrepareSQLiteForMigrationPreservesClientSequence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		blockLater bool
+	}{
+		{name: "successful upgrade"},
+		{name: "later model failed", blockLater: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcPath := t.TempDir() + "/source.db"
+			src, err := gorm.Open(sqlite.Open(srcPath), &gorm.Config{Logger: logger.Discard})
+			if err != nil {
+				t.Fatalf("open source: %v", err)
+			}
+			defer closeGorm(src)
+			if err := src.AutoMigrate(&model.User{}, &model.Setting{}, &model.Inbound{}); err != nil {
+				t.Fatalf("create old panel tables: %v", err)
+			}
+			if err := src.Exec("CREATE TABLE clients (id integer PRIMARY KEY AUTOINCREMENT, email varchar NOT NULL)").Error; err != nil {
+				t.Fatalf("create legacy clients: %v", err)
+			}
+			const deletedID = 1000
+			if err := src.Exec("INSERT INTO clients (id, email) VALUES (?, 'deleted@example.com')", deletedID).Error; err != nil {
+				t.Fatalf("seed legacy client: %v", err)
+			}
+			if err := src.Exec("DELETE FROM clients WHERE id = ?", deletedID).Error; err != nil {
+				t.Fatalf("delete legacy client: %v", err)
+			}
+			if tc.blockLater {
+				if err := src.Exec("CREATE VIEW outbound_subscriptions AS SELECT 1 AS id").Error; err != nil {
+					t.Fatalf("block a later schema migration: %v", err)
+				}
+			}
+			err = PrepareSQLiteForMigration(srcPath)
+			if tc.blockLater {
+				if err == nil || !strings.Contains(err.Error(), "upgrade panel schema for *model.OutboundSubscription") {
+					t.Fatalf("prepare migration error = %v, want outbound subscriptions error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("prepare migration: %v", err)
+			}
+			client := &model.ClientRecord{Email: "prepared@example.com"}
+			if err := src.Create(client).Error; err != nil || client.Id != deletedID+1 {
+				t.Fatalf("next client ID after schema upgrade = %d, %v, want %d", client.Id, err, deletedID+1)
+			}
+		})
 	}
 }
 
