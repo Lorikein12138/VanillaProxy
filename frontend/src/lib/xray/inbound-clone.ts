@@ -1,6 +1,11 @@
 import { RandomUtil } from '@/utils';
 import { createDefaultInboundSettings } from '@/lib/xray/inbound-defaults';
-import { coerceInboundJsonField, type DBInbound } from '@/models/dbinbound';
+import {
+  coerceInboundJsonField,
+  stripProxyBandwidthClientIds,
+  type DBInbound,
+} from '@/models/dbinbound';
+import { Protocols } from '@/schemas/primitives';
 
 /*
  * Payload for POST /panel/api/inbounds/add reproducing `dbInbound` as a
@@ -14,8 +19,14 @@ export function buildClonePayload(dbInbound: DBInbound, port: number, nodeId: nu
   let clonedSettings: string;
   try {
     const raw = { ...coerceInboundJsonField(dbInbound.settings) };
-    raw.clients = [];
-    clonedSettings = JSON.stringify(raw);
+    if (dbInbound.protocol === Protocols.HTTP || dbInbound.protocol === Protocols.MIXED) {
+      delete raw.clients;
+    } else {
+      raw.clients = [];
+    }
+    clonedSettings = JSON.stringify(
+      dbInbound.nodeId || nodeId ? stripProxyBandwidthClientIds(dbInbound.protocol, raw) : raw,
+    );
   } catch {
     const fallback = createDefaultInboundSettings(dbInbound.protocol);
     clonedSettings = fallback ? JSON.stringify(fallback, null, 2) : '{}';

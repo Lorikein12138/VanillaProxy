@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -418,6 +419,230 @@ func TestSocksRelayDialUDP(t *testing.T) {
 	}
 	if recvAddr.IP.String() != "8.8.8.8" || recvAddr.Port != 53 {
 		t.Fatalf("unexpected addr: %v", recvAddr)
+	}
+}
+
+func TestSocksRelayBoundUDP(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		address string
+		bound   bool
+	}{
+		{name: "bound IPv4", address: "127.0.0.1", bound: true},
+		{name: "bound IPv6", address: "::1", bound: true},
+		{name: "default IPv4", address: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := netip.MustParseAddr(tc.address)
+			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip.AsSlice()})
+			if err != nil {
+				if ip.Is6() {
+					t.Skipf("IPv6 loopback unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			_ = listener.SetDeadline(time.Now().Add(2 * time.Second))
+			if ip.Is6() {
+				probe, err := net.DialTimeout("tcp6", listener.Addr().String(), time.Second)
+				if err != nil {
+					t.Skipf("IPv6 loopback connection unavailable: %v", err)
+				}
+				_ = probe.Close()
+				accepted, err := listener.AcceptTCP()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = accepted.Close()
+			}
+
+			openUDP := func() *net.UDPConn {
+				conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip.AsSlice()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = conn.Close() })
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				return conn
+			}
+			relayUDP, otherUDP := openUDP(), openUDP()
+			relay := &SocksRelay{Addr: listener.Addr().String(), Password: "pass", RequireBoundUDP: tc.bound}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			type result struct {
+				session *SocksUDPSession
+				err     error
+			}
+			dialed := make(chan result, 1)
+			go func() {
+				session, err := relay.DialUDP(ctx, "user")
+				dialed <- result{session, err}
+			}()
+			var res result
+			received := false
+			defer func() {
+				cancel()
+				if !received {
+					res = <-dialed
+				}
+				if res.session != nil {
+					_ = res.session.Close()
+				}
+			}()
+
+			control, err := listener.AcceptTCP()
+			if err != nil {
+				res = <-dialed
+				received = true
+				t.Fatalf("accept control connection: %v (DialUDP: %v)", err, res.err)
+			}
+			defer control.Close()
+			_ = control.SetDeadline(time.Now().Add(2 * time.Second))
+			greeting := []byte{5, 2, 0, 2}
+			if tc.bound {
+				greeting = []byte{5, 1, 2}
+			}
+			expectSocksBytes(t, control, greeting)
+			if tc.bound {
+				writeSocksTestBytes(t, control, []byte{5, 2})
+				expectSocksBytes(t, control, []byte("\x01\x04user\x04pass"))
+				writeSocksTestBytes(t, control, []byte{1, 0})
+			} else {
+				writeSocksTestBytes(t, control, []byte{5, 0})
+			}
+
+			var request [4]byte
+			if _, err := io.ReadFull(control, request[:]); err != nil {
+				t.Fatal(err)
+			}
+			if request[0] != 5 || request[1] != 3 || request[2] != 0 {
+				t.Fatalf("invalid UDP ASSOCIATE request %x", request)
+			}
+			clientIP, err := readSocks5Addr(control, request[3])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var clientPort uint16
+			if err := binary.Read(control, binary.BigEndian, &clientPort); err != nil {
+				t.Fatal(err)
+			}
+			clientEP := netip.AddrPortFrom(clientIP, clientPort)
+			if tc.bound {
+				if clientIP != ip || clientPort == 0 {
+					t.Fatalf("UDP ASSOCIATE endpoint = %s, want actual socket on %s", clientEP, ip)
+				}
+			} else if clientEP.String() != "0.0.0.0:0" {
+				t.Fatalf("default UDP ASSOCIATE endpoint = %s, want 0.0.0.0:0", clientEP)
+			}
+
+			target := &Address{Type: AddrTypeIPv4, IP: net.IPv4(192, 0, 2, 1), Port: 53}
+			queue := func(from *net.UDPConn, payload string, to netip.AddrPort) {
+				packet, err := buildSocks5UDPRequest(target, []byte(payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := from.WriteToUDPAddrPort(packet, to); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.bound {
+				// Queue both packets before the reply so accepting the second
+				// proves the advertised socket stayed open through setup.
+				queue(otherUDP, "foreign", clientEP)
+				queue(relayUDP, "from relay", clientEP)
+			}
+			local := relayUDP.LocalAddr().(*net.UDPAddr)
+			addrType := AddrTypeIPv4
+			if ip.Is6() {
+				addrType = AddrTypeIPv6
+			}
+			reply := buildSocks5ConnectRequest(&Address{Type: addrType, IP: local.IP, Port: uint16(local.Port)})
+			reply[1] = 0
+			writeSocksTestBytes(t, control, reply)
+			res = <-dialed
+			received = true
+			if res.err != nil {
+				t.Fatal(res.err)
+			}
+			session := res.session
+			_ = session.udpConn.SetDeadline(time.Now().Add(2 * time.Second))
+			if _, err := session.Send(target, []byte("to relay")); err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, 128)
+			n, from, err := relayUDP.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n < 10 || string(buf[10:n]) != "to relay" {
+				t.Fatalf("unexpected outgoing UDP packet %x", buf[:n])
+			}
+			if tc.bound {
+				if from != clientEP {
+					t.Fatalf("UDP packet source = %s, advertised %s", from, clientEP)
+				}
+			} else {
+				queue(relayUDP, "from relay", from)
+			}
+			_, payload, err := session.Receive(buf)
+			if err != nil || string(payload) != "from relay" {
+				t.Fatalf("received %q, error %v", payload, err)
+			}
+		})
+	}
+}
+
+func TestSocksRelayBoundTCPRejectsNoAuth(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_ = listener.SetDeadline(time.Now().Add(2 * time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	relay := &SocksRelay{Addr: listener.Addr().String(), Password: "pass", RequireBoundUDP: true}
+	dialed := make(chan error, 1)
+	go func() {
+		conn, err := relay.DialTCP(ctx, "user", &Address{Type: AddrTypeIPv4, IP: net.IPv4(192, 0, 2, 1), Port: 80})
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialed <- err
+	}()
+
+	control, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	_ = control.SetDeadline(time.Now().Add(2 * time.Second))
+	expectSocksBytes(t, control, []byte{5, 1, 2})
+	writeSocksTestBytes(t, control, []byte{5, 0})
+	if err := <-dialed; err == nil || !strings.Contains(err.Error(), "password authentication required") {
+		t.Fatalf("DialTCP error = %v, want authentication downgrade rejected", err)
+	}
+	var next [1]byte
+	if _, err := control.Read(next[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("control connection read error = %v, want EOF", err)
+	}
+}
+
+func expectSocksBytes(t *testing.T, r io.Reader, want []byte) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(r, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("received %x, want %x", got, want)
+	}
+}
+
+func writeSocksTestBytes(t *testing.T, w io.Writer, data []byte) {
+	t.Helper()
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
 	}
 }
 

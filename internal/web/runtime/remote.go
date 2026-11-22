@@ -50,6 +50,7 @@ const errBodyDiagBytes = 8 << 10 // 8 KiB
 
 // errRemoteResponseTooLarge is returned when a node response exceeds the cap.
 var errRemoteResponseTooLarge = errors.New("remote response exceeds size limit")
+var errPrivateSnapshotRedirect = errors.New("private node snapshot redirected")
 
 // readCappedBody reads all of r but rejects bodies larger than limit, returning
 // errRemoteResponseTooLarge. It reads at most limit+1 bytes so a body of exactly
@@ -67,9 +68,11 @@ func readCappedBody(r io.Reader, limit int64) ([]byte, error) {
 }
 
 type envelope struct {
-	Success bool            `json:"success"`
-	Msg     string          `json:"msg"`
-	Obj     json.RawMessage `json:"obj"`
+	Success            bool            `json:"success"`
+	Msg                string          `json:"msg"`
+	Obj                json.RawMessage `json:"obj"`
+	verifiedDirectPeer bool
+	proxyInventoryGUID string
 }
 
 // remoteAPIError is a node-panel envelope failure (HTTP 200, success=false),
@@ -287,12 +290,21 @@ func (r *Remote) do(ctx context.Context, method, path string, body any) (*envelo
 	if err != nil {
 		return nil, err
 	}
+	privateSnapshot := req.URL.Query().Get(wirecodec.BandwidthProxyBindingsQuery) == "1"
+	if privateSnapshot {
+		direct := *client
+		direct.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &direct
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	r.recordCaps(resp.Header)
+	if privateSnapshot && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, errPrivateSnapshotRedirect
+	}
 
 	// Validate status before reading a success payload: a non-OK response's
 	// body is never used beyond a short diagnostic, so don't let a node force us
@@ -329,7 +341,32 @@ func (r *Remote) do(ctx context.Context, method, path string, body any) (*envelo
 	if !env.Success {
 		return &env, &remoteAPIError{msg: env.Msg}
 	}
+	env.verifiedDirectPeer = r.isVerifiedDirectPeer(resp, req)
+	if privateSnapshot && env.verifiedDirectPeer {
+		env.proxyInventoryGUID = resp.Header.Get(wirecodec.BandwidthProxyInventoryHeader)
+	}
 	return &env, nil
+}
+
+func (r *Remote) isVerifiedDirectPeer(resp *http.Response, req *http.Request) bool {
+	if r.node.OutboundTag != "" || req.URL.Scheme != "https" || resp.Request == nil ||
+		resp.Request.Response != nil || resp.Request.URL.String() != req.URL.String() ||
+		resp.TLS == nil || !resp.TLS.HandshakeComplete {
+		return false
+	}
+	switch r.node.TlsVerifyMode {
+	case "", "verify", "mtls":
+		return len(resp.TLS.VerifiedChains) != 0
+	case "pin":
+		if len(resp.TLS.PeerCertificates) == 0 {
+			return false
+		}
+		want, err := DecodeCertPin(r.node.PinnedCertSha256)
+		got := sha256.Sum256(resp.TLS.PeerCertificates[0].Raw)
+		return err == nil && bytes.Equal(want, got[:])
+	default:
+		return false
+	}
 }
 
 func (r *Remote) resolveRemoteID(ctx context.Context, tag string) (int, error) {
@@ -803,7 +840,65 @@ type TrafficSnapshot struct {
 	LastOnlineMap     map[string]int64
 	// HostGroups carries the node's per-inbound host overrides (TLS/SNI/
 	// fingerprint), fetched only when the snapshot holds a not-yet-adopted tag.
-	HostGroups []*entity.HostGroup
+	HostGroups              []*entity.HostGroup
+	bandwidthProxyBindings  map[int][]BandwidthProxyBinding
+	bandwidthProxyPeer      *model.Node
+	bandwidthProxyStartedAt int64
+	bandwidthInventoryGUID  string
+	bandwidthInventoryIDs   map[int]bool
+}
+
+// BandwidthProxyBinding is an exact authenticated credential projection from
+// the physical serving panel. Client IDs never cross this boundary.
+type BandwidthProxyBinding struct {
+	OwnerEmail            string `json:"ownerEmail"`
+	LeafOwnerKey          string `json:"leafOwnerKey"`
+	CredentialFingerprint string `json:"credentialFingerprint"`
+}
+
+// NodeSnapshotInbound is only used by the effective node snapshot endpoint.
+type NodeSnapshotInbound struct {
+	*model.Inbound
+	BandwidthProxyBindings *[]BandwidthProxyBinding `json:"bandwidthProxyBindings,omitempty"`
+}
+
+func (row NodeSnapshotInbound) MarshalJSON() ([]byte, error) {
+	base, err := json.Marshal(row.Inbound)
+	if err != nil || row.Inbound == nil || row.BandwidthProxyBindings == nil {
+		return base, err
+	}
+	// Inbound has its own wire encoding for JSON-text settings fields.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(base, &fields); err != nil {
+		return nil, err
+	}
+	bindings, err := json.Marshal(row.BandwidthProxyBindings)
+	if err != nil {
+		return nil, err
+	}
+	fields["bandwidthProxyBindings"] = bindings
+	return json.Marshal(fields)
+}
+
+func (s *TrafficSnapshot) HasBandwidthProxyBindings() bool { return len(s.bandwidthProxyBindings) != 0 }
+
+func (s *TrafficSnapshot) HasBandwidthProxyInventory() bool { return s.bandwidthInventoryIDs != nil }
+
+func (s *TrafficSnapshot) BandwidthProxyInventoryFor(node *model.Node) map[int]bool {
+	if s.BandwidthProxyBindingsFor(node) == nil || node.Guid != s.bandwidthInventoryGUID {
+		return nil
+	}
+	return s.bandwidthInventoryIDs
+}
+
+// BandwidthProxyBindingsFor verifies the enrolled endpoint still matches the
+// endpoint that supplied the snapshot. The mirror transaction checks origin.
+func (s *TrafficSnapshot) BandwidthProxyBindingsFor(node *model.Node) map[int][]BandwidthProxyBinding {
+	if node == nil || !node.Enable || s.bandwidthProxyStartedAt <= node.ConfigDirtyAt ||
+		!sameRemoteIdentity(s.bandwidthProxyPeer, node) {
+		return nil
+	}
+	return s.bandwidthProxyBindings
 }
 
 // FetchHostGroups pulls the node's host overrides so a freshly adopted inbound
@@ -825,11 +920,23 @@ func (r *Remote) FetchHostGroups(ctx context.Context) ([]*entity.HostGroup, erro
 func (r *Remote) FetchTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) {
 	snap := &TrafficSnapshot{LastOnlineMap: map[string]int64{}}
 
-	envList, err := r.do(ctx, http.MethodGet, "panel/api/inbounds/list", nil)
+	query := url.Values{wirecodec.EffectiveNativeAuthQuery: {"1"}}
+	if r.requestsBandwidthProxyBindings() {
+		query.Set(wirecodec.BandwidthProxyBindingsQuery, "1")
+	}
+	snap.bandwidthProxyStartedAt = time.Now().UnixMilli()
+	envList, err := r.do(ctx, http.MethodGet, "panel/api/inbounds/list?"+query.Encode(), nil)
+	if errors.Is(err, errPrivateSnapshotRedirect) {
+		query.Del(wirecodec.BandwidthProxyBindingsQuery)
+		envList, err = r.do(ctx, http.MethodGet, "panel/api/inbounds/list?"+query.Encode(), nil)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(envList.Obj, &snap.Inbounds); err != nil {
+	if query.Get(wirecodec.BandwidthProxyBindingsQuery) != "1" {
+		envList.verifiedDirectPeer = false
+	}
+	if err := snap.decodeInbounds(envList, r.node); err != nil {
 		return nil, fmt.Errorf("decode inbound list: %w", err)
 	}
 
@@ -865,6 +972,69 @@ func (r *Remote) FetchTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, er
 	return snap, nil
 }
 
+func (r *Remote) requestsBandwidthProxyBindings() bool {
+	if r.node.OutboundTag != "" || (r.node.Scheme != "https" && r.node.Scheme != "") {
+		return false
+	}
+	switch r.node.TlsVerifyMode {
+	case "", "verify", "mtls":
+		return true
+	case "pin":
+		_, err := DecodeCertPin(r.node.PinnedCertSha256)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func (s *TrafficSnapshot) decodeInbounds(env *envelope, node *model.Node) error {
+	if !env.verifiedDirectPeer {
+		return json.Unmarshal(env.Obj, &s.Inbounds)
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(env.Obj, &rows); err != nil {
+		return err
+	}
+	s.bandwidthProxyPeer = node
+	s.bandwidthProxyBindings = make(map[int][]BandwidthProxyBinding)
+	seenIDs := make(map[int]bool)
+	completeInventory := rows != nil && env.proxyInventoryGUID != ""
+	for _, raw := range rows {
+		var inbound *model.Inbound
+		if err := json.Unmarshal(raw, &inbound); err != nil {
+			return err
+		}
+		s.Inbounds = append(s.Inbounds, inbound)
+		if inbound == nil || inbound.Id <= 0 {
+			completeInventory = false
+			continue
+		}
+		if seenIDs[inbound.Id] {
+			completeInventory = false
+			delete(s.bandwidthProxyBindings, inbound.Id)
+			continue
+		}
+		seenIDs[inbound.Id] = true
+		if inbound.NodeID != nil || inbound.OriginNodeGuid == "" || (inbound.Protocol != model.HTTP && inbound.Protocol != model.Mixed) {
+			continue
+		}
+		if _, marked := model.StripInboundProxyBandwidthBindings(inbound.Protocol, inbound.Settings); marked {
+			continue
+		}
+		var metadata struct {
+			Bindings []BandwidthProxyBinding `json:"bandwidthProxyBindings"`
+		}
+		if json.Unmarshal(raw, &metadata) == nil && metadata.Bindings != nil {
+			s.bandwidthProxyBindings[inbound.Id] = metadata.Bindings
+		}
+	}
+	if completeInventory {
+		s.bandwidthInventoryGUID = env.proxyInventoryGUID
+		s.bandwidthInventoryIDs = seenIDs
+	}
+	return nil
+}
+
 // PushGlobalClientTraffics sends this panel's aggregated per-client usage to
 // the node, tagged with this panel's GUID so the node keeps one row per
 // pushing master. Display/enforcement input on the node only — the node never
@@ -890,7 +1060,8 @@ func wireInbound(ib *model.Inbound, remoteNodeID int) url.Values {
 	v.Set("listen", ib.Listen)
 	v.Set("port", strconv.Itoa(ib.Port))
 	v.Set("protocol", string(ib.Protocol))
-	v.Set("settings", ib.Settings)
+	settings, _ := model.StripInboundProxyBandwidthBindings(ib.Protocol, ib.Settings)
+	v.Set("settings", settings)
 	v.Set("streamSettings", sanitizeStreamSettingsForRemote(ib.StreamSettings))
 	tag := ib.Tag
 	if remoteNodeID > 0 {

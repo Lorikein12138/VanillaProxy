@@ -19,6 +19,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgkern"
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthruntime"
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/eventbus"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -117,6 +118,7 @@ func EmbeddedDist() embed.FS {
 type Server struct {
 	httpServer *http.Server
 	listener   net.Listener
+	bandwidth  *bandwidthruntime.PanelRuntime
 
 	index *controller.IndexController
 	panel *controller.XUIController
@@ -142,13 +144,19 @@ type Server struct {
 // NewServer installs the share-link provider before anything serves, so an early link request
 // no longer gets "sub link provider not registered".
 func NewServer(subLinkProvider service.SubLinkProvider) *Server {
+	return NewServerWithBandwidth(subLinkProvider, nil)
+}
+
+// NewServerWithBandwidth uses the process-owned runtime across panel reloads.
+func NewServerWithBandwidth(subLinkProvider service.SubLinkProvider, bandwidth *bandwidthruntime.PanelRuntime) *Server {
 	if subLinkProvider != nil {
 		service.RegisterSubLinkProvider(subLinkProvider)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:       ctx,
+		cancel:    cancel,
+		bandwidth: bandwidth,
 	}
 }
 
@@ -174,7 +182,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	}
 
 	engine := gin.Default()
-	directHTTPS := s.isDirectHTTPSConfigured()
+	directHTTPS := s.bandwidth.Node() != nil || s.isDirectHTTPSConfigured()
 	sendHSTS := directHTTPS && !config.IsSkipHSTS()
 	engine.Use(middleware.SecurityHeadersMiddleware(sendHSTS))
 
@@ -257,6 +265,13 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	controller.SetDistFS(distFS)
 
 	g := engine.Group(basePath)
+	mountBandwidthExchange(g, s.bandwidth.ExchangeHandler())
+	policyAWGJob := job.NewAmneziaWGJob()
+	mountBandwidthPolicy(g, s.bandwidth.PolicyHandler(func(ctx context.Context, install func() (bool, error)) (bandwidthruntime.XrayPolicyLiveAccounts, error) {
+		return s.xrayService.ApplyBandwidthXrayPolicy(ctx, s.bandwidth, install, func(stop bool) error {
+			return policyAWGJob.ReconcileBandwidthKernelPolicy(s.bandwidth, stop)
+		})
+	}))
 	g.GET("/manifest.webmanifest", controller.ServePWAManifest)
 	g.GET("/pwa-register.js", controller.ServePWARegister)
 	g.GET("/service-worker.js", controller.ServePWAServiceWorker)
@@ -264,7 +279,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
-	s.api = controller.NewAPIController(g)
+	s.api = controller.NewAPIControllerWithBandwidth(g, s.bandwidth)
 
 	// Initialize WebSocket hub
 	s.wsHub = websocket.NewHub()
@@ -322,7 +337,7 @@ const (
 
 // startTask schedules background jobs (Xray checks, traffic jobs, cron
 // jobs) which the panel relies on for periodic maintenance and monitoring.
-func (s *Server) startTask(restartXray bool, loc *time.Location) {
+func (s *Server) startTask(restartXray bool, loc *time.Location, awgJob *job.AmneziaWGJob) {
 	if restartXray {
 		err := s.xrayService.RestartXray(true)
 		if err != nil {
@@ -345,13 +360,17 @@ func (s *Server) startTask(restartXray bool, loc *time.Location) {
 	// Reconcile mtproto (mtg) sidecars and scrape their traffic
 	mtJob := job.NewMtprotoJob()
 	_, _ = s.cron.AddJob(cadenceMtproto, mtJob)
-	go mtJob.Run()
+	if s.bandwidth.Node() == nil {
+		go mtJob.Run()
 
-	// Reconcile embedded AmneziaWG interfaces; traffic rides Xray's own stats
-	awgJob := job.NewAmneziaWGJob()
-	_, _ = s.cron.AddJob(cadenceAmneziaWG, awgJob)
-	go awgJob.Run()
+		// Reconcile embedded AmneziaWG interfaces; traffic rides Xray's own stats.
+		_, _ = s.cron.AddJob(cadenceAmneziaWG, awgJob)
+		go awgJob.Run()
 
+	} else {
+		_, _ = s.cron.AddFunc(cadenceAmneziaWG, s.xrayService.ReconcileBandwidthAmneziaWG)
+		_, _ = s.cron.AddFunc(cadenceAmneziaWG, func() { awgJob.RunBandwidthKernel(s.bandwidth) })
+	}
 	tuicJob := job.NewTuicJob()
 	_, _ = s.cron.AddJob(cadenceTuic, tuicJob)
 	go tuicJob.Run()
@@ -523,12 +542,33 @@ func (s *Server) StartPanelOnly() (err error) {
 }
 
 func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
-	// This is an anonymous function, no function name
+	managedNode := s.bandwidth.Node() != nil
 	defer func() {
 		if err != nil {
+			if managedNode && !service.BandwidthNodeConfigured(s.bandwidth) {
+				_ = s.StopPanelOnly()
+				return
+			}
 			_ = s.Stop()
 		}
 	}()
+
+	var bandwidthCert *tls.Certificate
+	if managedNode {
+		bandwidthCert, err = s.loadBandwidthTLSCertificate()
+		if err != nil {
+			return err
+		}
+		if err := checkBandwidthSidecars(service.BandwidthNodeConfigured(s.bandwidth)); err != nil {
+			return err
+		}
+		if err := checkBandwidthStockChildren(); err != nil {
+			return err
+		}
+		if err := service.ConfigureBandwidthNode(s.bandwidth); err != nil {
+			return err
+		}
+	}
 
 	loc, err := s.settingService.GetTimeLocation()
 	if err != nil {
@@ -555,10 +595,15 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 	// add/update/delete to either the local xray or a remote node panel.
 	// The closures bridge into XrayService (which owns the running xray
 	// process state) without forcing the runtime package to import service.
+	awgJob := job.NewAmneziaWGJob()
 	mgr := runtime.NewManager(runtime.LocalDeps{
 		APIPort:          func() int { return s.xrayService.GetXrayAPIPort() },
 		SetNeedRestart:   func() { s.xrayService.SetToNeedRestart() },
 		RequestReconcile: func() { s.xrayService.SetToNeedReconcile() },
+		ReconcileKernelAmneziaWG: func() error {
+			return awgJob.ReconcileBandwidthKernel(s.bandwidth)
+		},
+		BandwidthManaged: managedNode,
 	})
 	runtime.SetManager(mgr)
 	mgr.SetNodeEgressResolver(&s.settingService)
@@ -606,8 +651,14 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 	if err != nil {
 		return err
 	}
-	if certFile != "" || keyFile != "" {
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if bandwidthCert != nil || certFile != "" || keyFile != "" {
+		var cert tls.Certificate
+		var err error
+		if bandwidthCert != nil {
+			cert = *bandwidthCert
+		} else {
+			cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		}
 		if err == nil {
 			c := &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -626,7 +677,9 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 				applyNodeMtls(c, pool)
 				logger.Info("Node mTLS enabled: verifying client certificates for the node API")
 			}
-			listener = network.NewAutoHttpsListener(listener)
+			if !managedNode {
+				listener = network.NewAutoHttpsListener(listener)
+			}
 			listener = tls.NewListener(listener, c)
 			logger.Info("Web server running HTTPS on", listener.Addr())
 		} else {
@@ -646,7 +699,9 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	go network.ServeHTTP(s.httpServer, listener, "Web server")
+	if !managedNode {
+		go network.ServeHTTP(s.httpServer, listener, "Web server")
+	}
 
 	// Create event bus before startTask so jobs can use it
 	s.bus = eventbus.New(eventbus.DefaultBufferSize)
@@ -655,14 +710,14 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 	tgbot.EventBus = s.bus
 
 	// Wire xray crash callback BEFORE startTask so it's ready
-	xray.OnCrash = func(err error) {
+	xray.SetCrashHandler(func(err error) {
 		if s.bus != nil {
 			s.bus.Publish(eventbus.Event{
 				Type: eventbus.EventXrayCrash,
 				Data: err.Error(),
 			})
 		}
-	}
+	})
 
 	// Register email subscriber (always — it checks smtpEnable at runtime)
 	emailService := email.NewEmailService(s.settingService)
@@ -755,7 +810,19 @@ func (s *Server) start(restartXray bool, startTgBot bool) (err error) {
 		}
 	})
 
-	s.startTask(restartXray, loc)
+	if managedNode {
+		if restartXray {
+			if err := s.xrayService.RestartXray(true); err != nil {
+				return fmt.Errorf("start bandwidth-managed Xray: %w", err)
+			}
+			job.NewMtprotoJob().Run()
+			if err := awgJob.ReconcileBandwidthKernel(s.bandwidth); err != nil {
+				return fmt.Errorf("start bandwidth-managed kernel AmneziaWG: %w", err)
+			}
+		}
+		go network.ServeHTTP(s.httpServer, listener, "Web server")
+	}
+	s.startTask(restartXray && !managedNode, loc, awgJob)
 
 	if startTgBot {
 		isTgbotenabled, err := s.settingService.GetTgbotEnabled()
@@ -785,6 +852,9 @@ func (s *Server) StopPanelOnly() error {
 }
 
 func (s *Server) stop(stopXray bool, stopTgBot bool) error {
+	if stopXray && s.bandwidth.Node() != nil {
+		service.BeginBandwidthShutdown(s.bandwidth)
+	}
 	s.cancel()
 	var err1 error
 	var err2 error
@@ -803,9 +873,22 @@ func (s *Server) stop(stopXray bool, stopTgBot bool) error {
 			err2 = err
 		}
 		mtproto.GetManager().StopAll()
+		if s.bandwidth.Node() != nil && mtproto.GetManager().HasRunning() {
+			err2 = common.Combine(err2, errors.New("bandwidth-managed MTProto process did not stop"))
+		}
 		amneziawgnet.GetManager().StopAll()
-		job.NewAmneziaWGJob().FlushKernelTraffic()
-		amneziawgkern.GetManager().StopAll()
+		awgJob := job.NewAmneziaWGJob()
+		if s.bandwidth.Node() != nil {
+			if err := awgJob.StopBandwidthKernel(s.bandwidth); err != nil {
+				err2 = common.Combine(err2, err)
+			}
+			if amneziawgkern.GetManager().HasRunning() {
+				err2 = common.Combine(err2, errors.New("bandwidth-managed kernel AmneziaWG interface did not stop"))
+			}
+		} else {
+			awgJob.FlushKernelTraffic()
+			amneziawgkern.GetManager().StopAll()
+		}
 		amneziawgnet.GetOutboundManager().StopAll()
 	}
 	if stopXray {

@@ -815,8 +815,15 @@ export default function InboundFormModal({
 
       {protocol === Protocols.TUNNEL && <TunnelFields />}
 
-      {protocol === Protocols.HTTP && <HttpFields />}
-      {protocol === Protocols.MIXED && <MixedFields mixedUdpOn={mixedUdpOn} />}
+      {protocol === Protocols.HTTP && (
+        <HttpFields allowBandwidthBinding={!dbInbound?.nodeId && !wNodeId} />
+      )}
+      {protocol === Protocols.MIXED && (
+        <MixedFields
+          mixedUdpOn={mixedUdpOn}
+          allowBandwidthBinding={!dbInbound?.nodeId && !wNodeId}
+        />
+      )}
 
       {protocol === Protocols.MTPROTO && <MtprotoFields />}
 

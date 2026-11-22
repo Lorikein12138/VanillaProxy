@@ -280,7 +280,8 @@ func TestNewSocks5UDPSessionGivesUpOnSilentServer(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		sess, err := newSocks5UDPSession(ln.Addr().String(), "peer@example", "x")
+		relay := SocksRelay{Addr: ln.Addr().String(), Password: "x"}
+		sess, err := relay.newUDPSession("peer@example")
 		done <- result{sess, err}
 	}()
 
@@ -294,6 +295,6 @@ func TestNewSocks5UDPSessionGivesUpOnSilentServer(t *testing.T) {
 			t.Fatalf("associate error = %v, want one wrapping os.ErrDeadlineExceeded", got.err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("newSocks5UDPSession still blocked 2s past the associate deadline: a silent SOCKS5 server parks the tunnel's delivery path")
+		t.Fatal("newUDPSession still blocked 2s past the associate deadline: a silent SOCKS5 server parks the tunnel's delivery path")
 	}
 }

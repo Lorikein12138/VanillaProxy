@@ -34,8 +34,10 @@ type Server struct {
 	maxUdpRelayPacketSize int
 	pendingUdpBudget      pendingUdpBudget
 
-	users *UserRegistry
-	relay *SocksRelay
+	users           *UserRegistry
+	relay           *SocksRelay
+	bandwidth       func(context.Context, string, int) error
+	bandwidthClient func([16]byte, string) (string, bool)
 
 	tlsConfig    *tls.Config
 	quicConfig   *quic.Config
@@ -58,8 +60,27 @@ type Server struct {
 	running atomic.Bool
 }
 
+var errBandwidthClientUnbound = errors.New("tuic: authenticated client has no bandwidth binding")
+
 // NewServer creates a new TUIC v5 Server instance.
 func NewServer(inst Instance, relay *SocksRelay) (*Server, error) {
+	return NewServerWithBandwidth(inst, relay, nil, nil)
+}
+
+// NewServerWithBandwidth gates both directions of the server's payload traffic.
+// The resolver receives the successfully authenticated UUID and password and
+// returns the client's canonical ID. A missing binding denies payload traffic.
+// Both callbacks may be called concurrently. The gate must observe cancellation
+// and returns nil only when the specified number of bytes may be forwarded.
+func NewServerWithBandwidth(
+	inst Instance,
+	relay *SocksRelay,
+	gate func(context.Context, string, int) error,
+	resolve func([16]byte, string) (string, bool),
+) (*Server, error) {
+	if (gate == nil) != (resolve == nil) {
+		return nil, errors.New("tuic: bandwidth gate and client resolver must be configured together")
+	}
 	if err := ValidateClients(inst.Clients); err != nil {
 		return nil, err
 	}
@@ -122,6 +143,8 @@ func NewServer(inst Instance, relay *SocksRelay) (*Server, error) {
 		activeConns:           make(map[[16]byte]map[*quic.Conn]*User),
 		connections:           make(map[*quic.Conn]struct{}),
 		relay:                 relay,
+		bandwidth:             gate,
+		bandwidthClient:       resolve,
 		tlsConfig:             tlsConfig,
 		quicConfig:            quicConfig,
 		ctx:                   ctx,
@@ -129,6 +152,30 @@ func NewServer(inst Instance, relay *SocksRelay) (*Server, error) {
 	}
 	s.updateRuntimeSettings(inst.Tag, inst.CongestionControl, inst.LogLevel)
 	return s, nil
+}
+
+func (s *Server) bandwidthClientID(user *User) (string, bool) {
+	return s.bandwidthClient(user.UUID, user.Password)
+}
+
+func (s *Server) waitBandwidth(ctx context.Context, user *User, n int) error {
+	if s.bandwidth == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	clientID, ok := s.bandwidthClientID(user)
+	if !ok {
+		return errBandwidthClientUnbound
+	}
+	if clientID == "" {
+		return nil
+	}
+	if err := s.bandwidth(ctx, clientID, n); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // Start opens the UDP socket and starts the QUIC listener.
@@ -357,6 +404,7 @@ func (s *Server) handleConn(conn *quic.Conn) {
 		udpAssociations = newUdpAssociationRegistry(s.maxUdpRelayPacketSize)
 	)
 	udpAssociations.pendingBudget = &s.pendingUdpBudget
+	udpAssociations.queueRelayedPackets = s.bandwidth != nil
 
 	authTimer := time.AfterFunc(s.authTimeout, func() {
 		if authState.CompareAndSwap(0, 2) {
@@ -592,6 +640,11 @@ func (s *Server) handleBiStream(
 			s.logLimited(tuicLogWarn, "tcp-relay", 30*time.Second, "TCP relay failed: invalid target address")
 			return
 		}
+		if s.bandwidth != nil {
+			if _, ok := s.bandwidthClientID(user); !ok {
+				return
+			}
+		}
 		socksConn, err := s.relay.DialTCP(ctx, user.Email, target)
 		if err != nil {
 			s.logLimited(tuicLogWarn, "tcp-relay", 30*time.Second, "TCP relay failed: %v", err)
@@ -599,7 +652,11 @@ func (s *Server) handleBiStream(
 		}
 		s.logf(tuicLogInfo, "TCP relay started")
 
-		PipeBiDirectionalContext(ctx, tcpRelayStream{stream}, socksConn, &user.Traffic.BytesUp, &user.Traffic.BytesDown)
+		var gate func(context.Context, int) error
+		if s.bandwidth != nil {
+			gate = func(ctx context.Context, n int) error { return s.waitBandwidth(ctx, user, n) }
+		}
+		pipeBiDirectionalContext(ctx, tcpRelayStream{stream}, socksConn, &user.Traffic.BytesUp, &user.Traffic.BytesDown, gate)
 		s.logf(tuicLogDebug, "TCP relay closed")
 	}
 }
@@ -840,29 +897,37 @@ func (s *Server) forwardUDPPacket(
 	if association == nil || len(payload) > s.maxUdpRelayPacketSize || !isPacketTarget(target) {
 		return
 	}
-	sess, opening, err := udpAssociations.queuePacket(ctx, assocID, association, target, payload)
+	sess, queued, err := udpAssociations.queuePacket(ctx, assocID, association, target, payload)
 	if err != nil {
 		s.logLimited(tuicLogWarn, "udp-queue", 30*time.Second, "UDP relay packet could not be queued: %v", err)
 		return
 	}
 	if sess != nil {
-		s.sendUDPRequest(user, sess, target, payload)
+		s.sendUDPRequest(ctx, user, sess, target, payload)
 		return
 	}
-	if opening == nil {
+	if queued == nil {
 		return
 	}
 	relayWg.Add(1)
 	go func() {
 		defer relayWg.Done()
-		s.openUDPRelay(ctx, opening, conn, user, assocID, association, udpAssociations, relayWg)
+		s.drainUDPRelay(queued, conn, user, assocID, association, udpAssociations, relayWg)
 	}()
 }
 
-func (s *Server) openUDPRelay(ctx, opening context.Context, conn *quic.Conn, user *User, assocID uint16, association *udpAssociation, udpAssociations *udpAssociationRegistry, relayWg *sync.WaitGroup) {
-	_, created, err := udpAssociations.ensureRelay(opening, assocID, association, user, s.relay)
+func (s *Server) drainUDPRelay(ctx context.Context, conn *quic.Conn, user *User, assocID uint16, association *udpAssociation, udpAssociations *udpAssociationRegistry, relayWg *sync.WaitGroup) {
+	dial := func(ctx context.Context) (*SocksUDPSession, error) {
+		if s.bandwidth != nil {
+			if _, ok := s.bandwidthClientID(user); !ok {
+				return nil, errBandwidthClientUnbound
+			}
+		}
+		return s.relay.DialUDP(ctx, user.Email)
+	}
+	_, created, err := udpAssociations.ensureRelay(ctx, assocID, association, dial)
 	if err != nil {
-		if opening.Err() == nil {
+		if ctx.Err() == nil && !errors.Is(err, errBandwidthClientUnbound) {
 			s.logLimited(tuicLogWarn, "udp-dial", 30*time.Second, "UDP relay could not be opened: %v", err)
 		}
 		udpAssociations.failPending(association)
@@ -883,13 +948,16 @@ func (s *Server) openUDPRelay(ctx, opening context.Context, conn *quic.Conn, use
 			return
 		}
 		if ctx.Err() == nil {
-			s.sendUDPRequest(user, sess, packet.target, packet.payload)
+			s.sendUDPRequest(ctx, user, sess, packet.target, packet.payload)
 		}
 		udpAssociations.releasePendingPacket(packet)
 	}
 }
 
-func (s *Server) sendUDPRequest(user *User, sess *udpRelaySession, target *Address, payload []byte) {
+func (s *Server) sendUDPRequest(ctx context.Context, user *User, sess *udpRelaySession, target *Address, payload []byte) {
+	if s.waitBandwidth(ctx, user, len(payload)) != nil {
+		return
+	}
 	if _, err := sess.relay.Send(target, payload); err != nil {
 		s.logLimited(tuicLogWarn, "udp-send", 30*time.Second, "UDP relay request failed: %v", err)
 		return
@@ -925,6 +993,15 @@ func (s *Server) relayUDPResponses(
 		}
 		if len(respPayload) > s.maxUdpRelayPacketSize {
 			continue
+		}
+		if s.bandwidth != nil {
+			err := s.waitBandwidth(ctx, user, len(respPayload))
+			if ctx.Err() != nil || sess.relay.closed.Load() {
+				return
+			}
+			if err != nil {
+				continue
+			}
 		}
 
 		user.Traffic.BytesDown.Add(int64(len(respPayload)))

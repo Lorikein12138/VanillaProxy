@@ -21,10 +21,15 @@ func startLifecycleTestServer(t *testing.T, relayAddr, email string) (*Server, *
 
 func startLifecycleTestServerWithRelay(t *testing.T, relay *SocksRelay, email string) (*Server, *clientquic.Conn, uuid.UUID, string) {
 	t.Helper()
+	return startLifecycleTestServerWithConstructor(t, relay, email, NewServer)
+}
+
+func startLifecycleTestServerWithConstructor(t *testing.T, relay *SocksRelay, email string, newServer func(Instance, *SocksRelay) (*Server, error)) (*Server, *clientquic.Conn, uuid.UUID, string) {
+	t.Helper()
 	cert, key := generateTestCert(t)
 	clientID := uuid.New()
 	password := "lifecycle-test-password"
-	server, err := NewServer(Instance{
+	server, err := newServer(Instance{
 		Id: 99101, Tag: "lifecycle-test", Listen: "127.0.0.1", Port: 0,
 		Certificate: string(cert), PrivateKey: string(key), ALPN: []string{"h3"},
 		AuthenticationTimeout: 2, MaxIdleTime: 30,

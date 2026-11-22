@@ -18,6 +18,12 @@ const (
 	CapsHeader = "X-3x-Node-Caps"
 	// MasterPushHeader marks a request as a master's push, whatever its token scope.
 	MasterPushHeader = "X-3x-Master-Push"
+	// EffectiveNativeAuthQuery selects live native credentials in a node snapshot.
+	EffectiveNativeAuthQuery = "effectiveNativeAuth"
+	// BandwidthProxyBindingsQuery opts into private proxy ownership metadata.
+	BandwidthProxyBindingsQuery = "bandwidthProxyBindings"
+	// BandwidthProxyInventoryHeader identifies a complete private inbound inventory.
+	BandwidthProxyInventoryHeader = "X-3x-Bandwidth-Proxy-Inventory"
 	// EncodingZstd is the Content-Encoding value for a zstd-compressed body.
 	EncodingZstd = "zstd"
 	// CapZstd is the capability token advertised in CapsHeader.

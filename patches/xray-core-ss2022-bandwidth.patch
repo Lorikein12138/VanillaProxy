@@ -1,0 +1,840 @@
+diff --git a/proxy/shadowsocks_2022/bandwidth_multi_udp_test.go b/proxy/shadowsocks_2022/bandwidth_multi_udp_test.go
+new file mode 100644
+index 0000000..27b3218
+--- /dev/null
++++ b/proxy/shadowsocks_2022/bandwidth_multi_udp_test.go
+@@ -0,0 +1,244 @@
++package shadowsocks_2022
++
++import (
++	"bytes"
++	"context"
++	"testing"
++	"time"
++
++	policyapp "github.com/xtls/xray-core/app/policy"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/utils"
++	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/pipe"
++)
++
++func TestManagedMultiUserUDPAuthenticatedSession(t *testing.T) {
++	ctx := context.Background()
++	method, err := GetCipherMethod(MethodAES128GCM)
++	if err != nil {
++		t.Fatal(err)
++	}
++	master := bytes.Repeat([]byte{1}, method.KeySaltLength)
++	block, err := method.NewBlock(master)
++	if err != nil {
++		t.Fatal(err)
++	}
++	manager := NewUDPSessionManager(time.Minute)
++	inbound := &MultiUserInbound{
++		method: method, udpMasterCipher: block, udpSessions: manager,
++		usersByHash:  utils.NewTypedSyncMap[[AESBlockSize]byte, *protocol.MemoryUser](),
++		usersByEmail: utils.NewTypedSyncMap[string, *protocol.MemoryUser](),
++	}
++	inbound.EnableManagedUDP()
++
++	dest := net.UDPDestination(net.LocalHostIP, 9999)
++	newClient := func(email string, keyByte byte) (*protocol.MemoryUser, *ClientUDPSession) {
++		t.Helper()
++		key := bytes.Repeat([]byte{keyByte}, method.KeySaltLength)
++		user := &protocol.MemoryUser{Email: email, Account: &MemoryAccount{Key: key}}
++		if err := inbound.AddUser(ctx, user); err != nil {
++			t.Fatal(err)
++		}
++		codec, err := NewUDPPacketCodec(method, [][]byte{master, key})
++		if err != nil {
++			t.Fatal(err)
++		}
++		client, err := codec.NewClientSession()
++		if err != nil {
++			t.Fatal(err)
++		}
++		return user, client
++	}
++	roundTrip := func(user *protocol.MemoryUser, client *ClientUDPSession) *ServerUDPSession {
++		t.Helper()
++		payload := []byte(user.Email)
++		packet, err := client.EncodePacket(dest, payload)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer packet.Release()
++		s, decoded, err := inbound.decodeUDPPacket(packet.Bytes())
++		if err != nil {
++			t.Fatal(err)
++		}
++		if s.User != user || s.key != (udpSessionKey{id: client.ClientSessionID(), user: user}) || !bytes.Equal(decoded.Payload, payload) {
++			t.Fatal("request lost its authenticated session or payload")
++		}
++		reply, err := inbound.encodeUDPSessionReply(s, dest, payload)
++		if err != nil {
++			t.Fatal(err)
++		}
++		decoded, err = client.DecodePacket(reply)
++		if err != nil || !bytes.Equal(decoded.Payload, payload) {
++			t.Fatalf("reply did not use the same authenticated session: %v", err)
++		}
++		return s
++	}
++
++	a, clientA := newClient("alice", 2)
++	b, clientB := newClient("bob", 3)
++	sessionA := roundTrip(a, clientA)
++	sessionB := roundTrip(b, clientB)
++	if sessionA == sessionB || roundTrip(a, clientA) != sessionA || roundTrip(b, clientB) != sessionB {
++		t.Fatal("interleaved users did not retain independent sessions")
++	}
++	if err := inbound.RemoveUser(ctx, a.Email); err != nil {
++		t.Fatal(err)
++	}
++	if !sessionA.closed.Load() || sessionB.closed.Load() {
++		t.Fatal("credential removal did not close just the revoked credential's sessions")
++	}
++	replacement, clientR := newClient(a.Email, 2)
++	if s := roundTrip(replacement, clientR); s == sessionA || s.key.user != replacement {
++		t.Fatal("replacement credential inherited the removed user record")
++	}
++}
++
++func TestManagedUDPSessionExpiryPreservesReplacement(t *testing.T) {
++	manager := NewUDPSessionManager(time.Minute)
++	user := &protocol.MemoryUser{Email: "alice"}
++	key := udpSessionKey{id: 41, user: user}
++	old := &ServerUDPSession{key: key, manager: manager}
++	current := &ServerUDPSession{key: key, manager: manager}
++	current.LastActive.Store(100)
++	manager.sessions.Store(key, current)
++
++	manager.removeManagedSession(old, 50)
++	manager.removeManagedSession(current, 50)
++	got, ok := manager.sessions.Load(key)
++	if !ok || got != current || current.closed.Load() || !old.closed.Load() {
++		t.Fatal("expiring a stale session removed its active replacement")
++	}
++}
++
++type managedUDPTestDispatcher struct {
++	routing.Dispatcher
++	onDispatch func(context.Context, net.Destination)
++}
++
++func (d managedUDPTestDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
++	if d.onDispatch != nil {
++		d.onDispatch(ctx, dest)
++	}
++	reader, writer := pipe.New()
++	return &transport.Link{Reader: reader, Writer: writer}, nil
++}
++
++type managedUDPTestConn struct {
++	net.Conn
++	writes int
++}
++
++func (c *managedUDPTestConn) RemoteAddr() net.Addr { return &net.UDPAddr{} }
++func (c *managedUDPTestConn) Write(packet []byte) (int, error) {
++	c.writes++
++	return len(packet), nil
++}
++
++func TestManagedUDPRoutingLinksCopyWorkerMetadata(t *testing.T) {
++	ctx := context.Background()
++	parentDest := net.UDPDestination(net.LocalHostIP, 10)
++	parentIn := &session.Inbound{Tag: "inbound"}
++	parentOut := []*session.Outbound{{Target: parentDest, Tag: "primary"}, {Tag: "secondary"}}
++	parentContent := &session.Content{
++		Protocol:        "original",
++		Attributes:      map[string]string{"inherited": "worker"},
++		SniffingRequest: session.SniffingRequest{OverrideDestinationForProtocol: []string{"http"}},
++	}
++	ctx = session.ContextWithInbound(ctx, parentIn)
++	ctx = session.ContextWithOutbounds(ctx, parentOut)
++	ctx = session.ContextWithContent(ctx, parentContent)
++	policyManager, err := policyapp.New(ctx, &policyapp.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	var contexts []context.Context
++	dispatcher := managedUDPTestDispatcher{onDispatch: func(child context.Context, dst net.Destination) {
++		contexts = append(contexts, child)
++		inbound := session.InboundFromContext(child)
++		outbounds := session.OutboundsFromContext(child)
++		content := session.ContentFromContext(child)
++		if len(outbounds) != 2 || outbounds[0].Target != parentDest || outbounds[1].Tag != "secondary" ||
++			inbound.Tag != "inbound" || content.Attribute("inherited") != "worker" {
++			t.Fatal("a routing link did not inherit the worker metadata")
++		}
++		outbounds[0].Target = dst
++		outbounds[0].RouteTarget = dst
++		outbounds[1].Tag = inbound.User.Email
++		content.Protocol = inbound.User.Email
++		content.SetAttribute("session", inbound.User.Email)
++		content.SniffingRequest.OverrideDestinationForProtocol[0] = inbound.User.Email
++	}}
++	users := []*protocol.MemoryUser{{Email: "alice"}, {Email: "bob"}}
++	conn := &managedUDPTestConn{}
++	for idx, user := range users {
++		s := &ServerUDPSession{key: udpSessionKey{id: uint64(idx), user: user}, User: user}
++		if _, err := s.EnsureLink(ctx, conn, net.UDPDestination(net.LocalHostIP, net.Port(100+idx)), dispatcher, policyManager, nil); err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(s.Close)
++	}
++	for idx, child := range contexts {
++		inbound := session.InboundFromContext(child)
++		outbounds := session.OutboundsFromContext(child)
++		content := session.ContentFromContext(child)
++		email := users[idx].Email
++		if inbound.User != users[idx] || outbounds[0].RouteTarget.Port != net.Port(100+idx) ||
++			outbounds[1].Tag != email || content.Protocol != email ||
++			content.Attribute("session") != email || content.SniffingRequest.OverrideDestinationForProtocol[0] != email {
++			t.Fatal("routing metadata changed when another session used the same worker")
++		}
++	}
++	if parentIn.User != nil || parentOut[0].Target != parentDest || parentOut[0].RouteTarget.IsValid() ||
++		parentOut[1].Tag != "secondary" || parentContent.Protocol != "original" ||
++		parentContent.Attribute("session") != "" || parentContent.SniffingRequest.OverrideDestinationForProtocol[0] != "http" {
++		t.Fatal("routing link modified the shared worker metadata")
++	}
++}
++
++func TestManagedUDPReplyRequiresCurrentLinkAndCredential(t *testing.T) {
++	ctx := context.Background()
++	policyManager, err := policyapp.New(ctx, &policyapp.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	dispatcher := managedUDPTestDispatcher{}
++	manager := NewUDPSessionManager(time.Minute)
++	user := &protocol.MemoryUser{Email: "alice"}
++	key := udpSessionKey{id: 1, user: user}
++	s := &ServerUDPSession{SessionID: key.id, key: key, User: user, manager: manager}
++	manager.sessions.Store(key, s)
++	t.Cleanup(s.Close)
++
++	dest := net.UDPDestination(net.LocalHostIP, 9999)
++	originalConn := &managedUDPTestConn{}
++	original, err := s.EnsureLink(ctx, originalConn, dest, dispatcher, policyManager, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := s.writeUDPResponse(original, []byte("first")); err != nil || originalConn.writes != 1 {
++		t.Fatalf("initial live link did not write: %v", err)
++	}
++
++	s.timer.SetTimeout(0)
++	replacementConn := &managedUDPTestConn{}
++	replacement, err := s.EnsureLink(ctx, replacementConn, dest, dispatcher, policyManager, nil)
++	if err != nil || replacement == original {
++		t.Fatalf("could not reopen routing link: %v", err)
++	}
++	if err := s.writeUDPResponse(original, []byte("stale")); err == nil || originalConn.writes != 1 || replacementConn.writes != 0 {
++		t.Fatal("a stale routing link wrote a packet after replacement")
++	}
++	if err := s.writeUDPResponse(replacement, []byte("second")); err != nil || replacementConn.writes != 1 {
++		t.Fatalf("replacement link did not write: %v", err)
++	}
++	manager.removeManagedUser(user)
++	if err := s.writeUDPResponse(replacement, []byte("revoked")); err == nil || replacementConn.writes != 1 {
++		t.Fatal("a removed credential wrote another packet")
++	}
++}
+diff --git a/proxy/shadowsocks_2022/inbound_multi.go b/proxy/shadowsocks_2022/inbound_multi.go
+index 185e061..36d5ee4 100644
+--- a/proxy/shadowsocks_2022/inbound_multi.go
++++ b/proxy/shadowsocks_2022/inbound_multi.go
+@@ -42,6 +42,7 @@ type MultiUserInbound struct {
+ 	userCount       atomic.Int64
+ 	saltFilter      *antireplay.ReplayFilter[[32]byte]
+ 	udpSessions     *UDPSessionManager
++	managedUDP      atomic.Bool
+ 	udpMasterCipher cipher.Block
+ 	policyManager   policy.Manager
+ }
+@@ -142,18 +143,21 @@ func (i *MultiUserInbound) RemoveUser(ctx context.Context, email string) error {
+ 	}
+ 
+ 	i.Lock()
+-	defer i.Unlock()
+-
+ 	emailKey := strings.ToLower(email)
+ 	u, loaded := i.usersByEmail.LoadAndDelete(emailKey)
+ 	if !loaded {
++		i.Unlock()
+ 		return errors.New("user ", email, " not found")
+ 	}
+ 
+ 	pskHash := DeriveUserPSKHash(u.Account.(*MemoryAccount).Key)
+-	i.usersByHash.Delete(pskHash)
++	i.usersByHash.CompareAndDelete(pskHash, u)
+ 	i.userCount.Add(-1)
++	i.Unlock()
+ 
++	if i.managedUDP.Load() {
++		i.udpSessions.removeManagedUser(u)
++	}
+ 	return nil
+ }
+ 
+@@ -271,6 +275,11 @@ func (i *MultiUserInbound) processTCP(ctx context.Context, conn net.Conn, dispat
+ 	return TransportTCP(ctx, i.policyManager.ForLevel(user.Level), reader, writer, link)
+ }
+ 
++// EnableManagedUDP opts in before this inbound starts receiving packets.
++func (i *MultiUserInbound) EnableManagedUDP() {
++	i.managedUDP.Store(true)
++}
++
+ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
+ 	reader := buf.NewPacketReader(conn)
+ 	for {
+@@ -281,72 +290,16 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
+ 		}
+ 
+ 		for _, b := range mb {
+-			// In multi-user UDP:
+-			// Packet header is 16 bytes: Encrypted(SessionID + PacketID)
+-			// Followed by 16 bytes EIH
+-			packetBytes := b.Bytes()
+-			if len(packetBytes) < 32+1+8+2 {
+-				b.Release()
+-				continue
+-			}
+-
+-			var rawHeader [16]byte
+-			i.udpMasterCipher.Decrypt(rawHeader[:], packetBytes[:16])
+-
+-			sessionID := binary.BigEndian.Uint64(rawHeader[:8])
+-			packetID := binary.BigEndian.Uint64(rawHeader[8:16])
+-
+-			sessionItem := i.udpSessions.GetOrCreate(sessionID)
+-
+-			if !sessionItem.CheckPacketID(packetID) {
+-				b.Release()
+-				continue
+-			}
+-
+-			var userPSK []byte
+-			var currentUser *protocol.MemoryUser
+-			sessionItem.Lock()
+-			currentUser = sessionItem.User
+-			userPSK = sessionItem.UserPSK
+-			sessionItem.Unlock()
+-
+-			if currentUser == nil {
+-				// Decrypt EIH
+-				decryptedHash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[16:32])
+-
+-				user, ok := i.usersByHash.Load(decryptedHash)
+-				if !ok {
+-					b.Release()
+-					continue
+-				}
+-				currentUser = user
+-				userPSK = user.Account.(*MemoryAccount).Key
+-			}
+-
+-			decoded, err := sessionItem.DecryptAESPayload(i.method, userPSK, sessionID, packetID, rawHeader[:], packetBytes[32:])
++			s, decoded, err := i.decodeUDPPacket(b.Bytes())
+ 			b.Release()
+ 			if err != nil {
+ 				continue
+ 			}
+-
+-			sessionItem.Lock()
+-			if sessionItem.User == nil {
+-				sessionItem.User = currentUser
+-				sessionItem.UserPSK = userPSK
+-			}
+-			sessionItem.Unlock()
+-
+-			link := sessionItem.link.Load()
+-			if link != nil {
+-				sessionItem.UpdateConn(conn)
+-			} else {
+-				var err error
+-				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
+-					return i.encodeServerUDPPacket(sessionID, userPSK, replyDest, payload)
+-				})
+-				if err != nil {
+-					continue
+-				}
++			link, err := s.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
++				return i.encodeUDPSessionReply(s, replyDest, payload)
++			})
++			if err != nil {
++				continue
+ 			}
+ 
+ 			pBuf := buf.New()
+@@ -357,6 +310,104 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
+ 	}
+ }
+ 
+-func (i *MultiUserInbound) encodeServerUDPPacket(clientSessionID uint64, userPSK []byte, dest net.Destination, payload []byte) ([]byte, error) {
+-	return i.udpSessions.EncodeServerPacket(i.method, userPSK, clientSessionID, dest, payload)
++func (i *MultiUserInbound) decodeUDPPacket(packet []byte) (*ServerUDPSession, DecodedUDPPacket, error) {
++	const headerSize = 2 * AESBlockSize
++	if len(packet) < headerSize+1+8+2+AEADTagSize {
++		return nil, DecodedUDPPacket{}, ErrPacketTooShort
++	}
++	var header [AESBlockSize]byte
++	i.udpMasterCipher.Decrypt(header[:], packet[:AESBlockSize])
++
++	sessionID := binary.BigEndian.Uint64(header[:8])
++	packetID := binary.BigEndian.Uint64(header[8:])
++	if i.managedUDP.Load() {
++		hash := DecryptUDPEIH(i.udpMasterCipher, header[:], packet[AESBlockSize:headerSize])
++		return i.decodeManagedUDPPacket(hash, sessionID, packetID, header[:], packet[headerSize:])
++	}
++
++	s := i.udpSessions.GetOrCreate(sessionID)
++	s.Lock()
++	user := s.User
++	key := s.UserPSK
++	s.Unlock()
++	if user == nil {
++		hash := DecryptUDPEIH(i.udpMasterCipher, header[:], packet[AESBlockSize:headerSize])
++		var ok bool
++		user, ok = i.usersByHash.Load(hash)
++		if !ok {
++			return nil, DecodedUDPPacket{}, ErrInvalidRequest
++		}
++		key = user.Account.(*MemoryAccount).Key
++	}
++	decoded, err := s.DecryptAESPayload(i.method, key, sessionID, packetID, header[:], packet[headerSize:])
++	if err != nil {
++		return nil, DecodedUDPPacket{}, err
++	}
++	s.Lock()
++	if s.User == nil {
++		s.User = user
++		s.UserPSK = key
++	}
++	s.Unlock()
++	return s, decoded, nil
++}
++
++func (i *MultiUserInbound) decodeManagedUDPPacket(hash [AESBlockSize]byte, sessionID, packetID uint64, header, body []byte) (*ServerUDPSession, DecodedUDPPacket, error) {
++	user, ok := i.usersByHash.Load(hash)
++	if !ok {
++		return nil, DecodedUDPPacket{}, ErrInvalidRequest
++	}
++	psk := user.Account.(*MemoryAccount).Key
++	key := udpSessionKey{id: sessionID, user: user}
++	manager := i.udpSessions
++	if s, ok := manager.sessions.Load(key); ok {
++		decoded, err := s.DecryptAESPayload(i.method, psk, sessionID, packetID, header, body)
++		if err == nil {
++			manager.maybeCleanup(time.Now().Unix())
++		}
++		return s, decoded, err
++	}
++
++	// Publish only after authenticating the payload. A concurrent first
++	// packet can win publication, in which case its replay window is used.
++	candidate := &ServerUDPSession{
++		SessionID: sessionID,
++		User:      user,
++		UserPSK:   psk,
++		key:       key,
++		manager:   manager,
++	}
++	decoded, err := candidate.DecryptAESPayload(i.method, psk, sessionID, packetID, header, body)
++	if err != nil {
++		return nil, DecodedUDPPacket{}, err
++	}
++	i.Lock()
++	current, _ := i.usersByHash.Load(hash)
++	if current != user {
++		i.Unlock()
++		return nil, DecodedUDPPacket{}, ErrInvalidRequest
++	}
++	s, loaded := manager.sessions.LoadOrStore(key, candidate)
++	i.Unlock()
++	if loaded {
++		decoded, err = s.DecryptAESPayload(i.method, psk, sessionID, packetID, header, body)
++	}
++	manager.maybeCleanup(time.Now().Unix())
++	return s, decoded, err
++}
++
++func (i *MultiUserInbound) encodeUDPSessionReply(s *ServerUDPSession, dest net.Destination, payload []byte) ([]byte, error) {
++	s.Lock()
++	psk := s.UserPSK
++	s.Unlock()
++	if s.key.user == nil {
++		return i.udpSessions.EncodeServerPacket(i.method, psk, s.SessionID, dest, payload)
++	}
++	if s.closed.Load() {
++		return nil, ErrInvalidRequest
++	}
++	if err := s.EnsureServerState(i.method, psk); err != nil {
++		return nil, err
++	}
++	return s.EncodeServerPacket(i.method, s.SessionID, dest, payload)
+ }
+diff --git a/proxy/shadowsocks_2022/packet.go b/proxy/shadowsocks_2022/packet.go
+index 310d3d7..5b796a1 100644
+--- a/proxy/shadowsocks_2022/packet.go
++++ b/proxy/shadowsocks_2022/packet.go
+@@ -248,6 +248,15 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
+ }
+ 
+ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
++	s.Lock()
++	defer s.Unlock()
++	if s.closed.Load() {
++		return DecodedUDPPacket{}, ErrInvalidRequest
++	}
++	if s.Window != nil && !s.Window.Check(packetID) {
++		return DecodedUDPPacket{}, ErrPacketIdNotUnique
++	}
++
+ 	bodyAead := s.clientBodyCipher
+ 	isNewCipher := false
+ 	if bodyAead == nil {
+@@ -275,7 +284,13 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
+ 		return DecodedUDPPacket{}, ErrBadHeaderType
+ 	}
+ 
+-	s.AddPacketID(packetID)
++	if s.Window == nil {
++		s.Window = new(SlidingWindow)
++	}
++	s.Window.Add(packetID)
++	if s.key.user != nil {
++		s.LastActive.Store(time.Now().Unix())
++	}
+ 
+ 	if isNewCipher {
+ 		s.clientBodyCipher = bodyAead
+diff --git a/proxy/shadowsocks_2022/replay.go b/proxy/shadowsocks_2022/replay.go
+index 056acbb..be2dd27 100644
+--- a/proxy/shadowsocks_2022/replay.go
++++ b/proxy/shadowsocks_2022/replay.go
+@@ -91,6 +91,8 @@ type ServerUDPSession struct {
+ 	serverHeaderBlock cipher.Block
+ 	serverChaCha      cipher.AEAD
+ 
++	key         udpSessionKey
++	closed      atomic.Bool
+ 	manager     *UDPSessionManager
+ 	link        atomic.Pointer[transport.Link]
+ 	timer       *signal.ActivityTimer
+@@ -115,45 +117,57 @@ func (s *ServerUDPSession) AddPacketID(packetID uint64) {
+ 	s.Window.Add(packetID)
+ }
+ 
++// Managed sessions are keyed by their authenticated credential generation.
++type udpSessionKey struct {
++	id   uint64
++	user *protocol.MemoryUser
++}
++
+ type UDPSessionManager struct {
+-	sessions  *utils.TypedSyncMap[uint64, *ServerUDPSession]
++	sessions  *utils.TypedSyncMap[udpSessionKey, *ServerUDPSession]
+ 	timeout   time.Duration
+ 	lastClean atomic.Int64 // Unix timestamp in seconds
+ }
+ 
+ func NewUDPSessionManager(timeout time.Duration) *UDPSessionManager {
+ 	return &UDPSessionManager{
+-		sessions: utils.NewTypedSyncMap[uint64, *ServerUDPSession](),
++		sessions: utils.NewTypedSyncMap[udpSessionKey, *ServerUDPSession](),
+ 		timeout:  timeout,
+ 	}
+ }
+ 
+ func (m *UDPSessionManager) GetOrCreate(sessionID uint64) *ServerUDPSession {
+ 	now := time.Now().Unix()
+-	if s, ok := m.sessions.Load(sessionID); ok {
++	key := udpSessionKey{id: sessionID}
++	if s, ok := m.sessions.Load(key); ok {
+ 		s.LastActive.Store(now)
+ 		return s
+ 	}
+ 
+ 	s := &ServerUDPSession{
+ 		SessionID: sessionID,
++		key:       key,
+ 		manager:   m,
+ 	}
+ 	s.LastActive.Store(now)
+ 
+-	actual, loaded := m.sessions.LoadOrStore(sessionID, s)
++	actual, loaded := m.sessions.LoadOrStore(key, s)
+ 	if loaded {
+ 		actual.LastActive.Store(now)
+ 		return actual
+ 	}
+ 
++	m.maybeCleanup(now)
++	return s
++}
++
++func (m *UDPSessionManager) maybeCleanup(now int64) {
+ 	// Trigger cleanup if at least 30 seconds have passed since last cleanup
+ 	last := m.lastClean.Load()
+ 	if now-last > 30 && m.lastClean.CompareAndSwap(last, now) {
+ 		go m.cleanup(now)
+ 	}
+ 
+-	return s
+ }
+ 
+ func (m *UDPSessionManager) cleanup(now int64) {
+@@ -161,17 +175,44 @@ func (m *UDPSessionManager) cleanup(now int64) {
+ 	if timeoutSec <= 0 {
+ 		timeoutSec = 60
+ 	}
+-	m.sessions.Range(func(k uint64, v *ServerUDPSession) bool {
+-		if now-v.LastActive.Load() > timeoutSec {
+-			m.sessions.Delete(k)
+-			v.Close()
++	m.sessions.Range(func(key udpSessionKey, s *ServerUDPSession) bool {
++		if s.LastActive.Load() < now-timeoutSec {
++			if key.user != nil {
++				m.removeManagedSession(s, now-timeoutSec)
++			} else if m.sessions.CompareAndDelete(key, s) {
++				s.Close()
++			}
+ 		}
+ 		return true
+ 	})
+ }
+ 
+ func (m *UDPSessionManager) Delete(sessionID uint64) {
+-	m.sessions.Delete(sessionID)
++	m.sessions.Delete(udpSessionKey{id: sessionID})
++}
++
++// A zero cutoff revokes the session immediately. Expiry checks for more
++// recent authenticated traffic under the same lock that accepts new packets.
++func (m *UDPSessionManager) removeManagedSession(s *ServerUDPSession, cutoff int64) {
++	s.Lock()
++	expired := cutoff == 0 || s.LastActive.Load() < cutoff
++	if expired {
++		s.closed.Store(true)
++		m.sessions.CompareAndDelete(s.key, s)
++	}
++	s.Unlock()
++	if expired {
++		s.Close()
++	}
++}
++
++func (m *UDPSessionManager) removeManagedUser(user *protocol.MemoryUser) {
++	m.sessions.Range(func(key udpSessionKey, s *ServerUDPSession) bool {
++		if key.user == user {
++			m.removeManagedSession(s, 0)
++		}
++		return true
++	})
+ }
+ 
+ func (m *UDPSessionManager) EncodeServerPacket(method *CipherMethod, psk []byte, clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {
+diff --git a/proxy/shadowsocks_2022/shadowsocks_2022.go b/proxy/shadowsocks_2022/shadowsocks_2022.go
+index 1556c33..51432e4 100644
+--- a/proxy/shadowsocks_2022/shadowsocks_2022.go
++++ b/proxy/shadowsocks_2022/shadowsocks_2022.go
+@@ -2,12 +2,16 @@ package shadowsocks_2022
+ 
+ import (
+ 	"context"
++	"maps"
++	"slices"
++	"time"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/session"
+ 	"github.com/xtls/xray-core/common/signal"
+ 	"github.com/xtls/xray-core/features/policy"
+@@ -35,11 +39,36 @@ func (s *ServerUDPSession) WriteToClient(b []byte) error {
+ 	return err
+ }
+ 
++func (s *ServerUDPSession) writeUDPResponse(link *transport.Link, packet []byte) error {
++	if s.key.user == nil {
++		return s.WriteToClient(packet)
++	}
++
++	s.Lock()
++	defer s.Unlock()
++	if s.closed.Load() || s.link.Load() != link {
++		return ErrInvalidRequest
++	}
++	if err := s.WriteToClient(packet); err != nil {
++		return err
++	}
++	s.LastActive.Store(time.Now().Unix())
++	return nil
++}
++
+ func (s *ServerUDPSession) Close() {
+-	if s.timer != nil {
+-		s.timer.SetTimeout(0)
++	s.Lock()
++	timer := s.timer
++	link := s.link.Load()
++	s.Unlock()
++	if timer != nil {
++		timer.SetTimeout(0)
+ 	}
+-	if link := s.link.Load(); link != nil {
++	interruptUDPLink(link)
++}
++
++func interruptUDPLink(link *transport.Link) {
++	if link != nil {
+ 		common.Interrupt(link.Reader)
+ 		common.Interrupt(link.Writer)
+ 	}
+@@ -56,6 +85,9 @@ func (s *ServerUDPSession) EnsureLink(
+ 	s.Lock()
+ 	defer s.Unlock()
+ 
++	if s.closed.Load() {
++		return nil, ErrInvalidRequest
++	}
+ 	if link := s.link.Load(); link != nil {
+ 		s.UpdateConn(conn)
+ 		return link, nil
+@@ -64,8 +96,10 @@ func (s *ServerUDPSession) EnsureLink(
+ 	s.currentConn.Store(conn)
+ 
+ 	sessCtx, cancel := context.WithCancel(ctx)
+-	inbound := session.InboundFromContext(sessCtx)
+-	if inbound != nil && s.User != nil {
++	managed := s.key.user != nil
++	if managed {
++		sessCtx = managedUDPRoutingContext(sessCtx, s.User)
++	} else if inbound := session.InboundFromContext(sessCtx); inbound != nil && s.User != nil {
+ 		inbound.User = s.User
+ 	}
+ 	var email string
+@@ -81,26 +115,67 @@ func (s *ServerUDPSession) EnsureLink(
+ 		Email:  email,
+ 	})
+ 
++	idle := policyManager.ForLevel(level).Timeouts.ConnectionIdle
++	if managed && idle == 0 {
++		cancel()
++		return nil, context.DeadlineExceeded
++	}
+ 	link, err := dispatcher.Dispatch(sessCtx, dest)
+ 	if err != nil {
+ 		cancel()
+ 		return nil, err
+ 	}
+ 
+-	sessionPolicy := policyManager.ForLevel(level)
+-	s.timer = signal.CancelAfterInactivity(sessCtx, func() {
+-		if s.manager != nil {
+-			s.manager.Delete(s.SessionID)
+-		}
+-		s.Close()
++	if managed {
++		s.link.Store(link)
++	}
++	timer := signal.CancelAfterInactivity(sessCtx, func() {
+ 		cancel()
+-	}, sessionPolicy.Timeouts.ConnectionIdle)
+-	s.link.Store(link)
++		if managed {
++			s.Lock()
++			s.link.CompareAndSwap(link, nil)
++			s.Unlock()
++		}
++		// Managed sessions can reopen a routing link with the same replay
++		// window when they receive another authenticated packet.
++		if s.manager != nil && !managed {
++			s.manager.sessions.CompareAndDelete(s.key, s)
++		}
++		interruptUDPLink(link)
++	}, idle)
++	s.timer = timer
++	if !managed {
++		s.link.Store(link)
++	}
+ 
+-	go handleUDPResponse(s, link, dest, responseEncoder)
++	go handleUDPResponse(s, timer, link, dest, responseEncoder)
+ 	return link, nil
+ }
+ 
++// The native UDP worker shares context across packets from one endpoint.
++func managedUDPRoutingContext(ctx context.Context, user *protocol.MemoryUser) context.Context {
++	if inbound := session.InboundFromContext(ctx); inbound != nil {
++		inboundCopy := *inbound
++		inboundCopy.User = user
++		ctx = session.ContextWithInbound(ctx, &inboundCopy)
++	}
++	outbounds := slices.Clone(session.OutboundsFromContext(ctx))
++	for idx, outbound := range outbounds {
++		if outbound != nil {
++			outboundCopy := *outbound
++			outbounds[idx] = &outboundCopy
++		}
++	}
++	ctx = session.ContextWithOutbounds(ctx, outbounds)
++	if content := session.ContentFromContext(ctx); content != nil {
++		contentCopy := *content
++		contentCopy.Attributes = maps.Clone(content.Attributes)
++		contentCopy.SniffingRequest.OverrideDestinationForProtocol = slices.Clone(content.SniffingRequest.OverrideDestinationForProtocol)
++		ctx = session.ContextWithContent(ctx, &contentCopy)
++	}
++	return ctx
++}
++
+ // ResetTCPConn sets SO_LINGER to 0 per SIP022 §3.1.4 to consistently send RST on close
+ // when handshake or header validation fails.
+ func ResetTCPConn(conn net.Conn) {
+@@ -110,14 +185,14 @@ func ResetTCPConn(conn net.Conn) {
+ 	}
+ }
+ 
+-func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
+-	defer s.timer.SetTimeout(0)
++func handleUDPResponse(s *ServerUDPSession, timer *signal.ActivityTimer, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
++	defer timer.SetTimeout(0)
+ 	for {
+ 		resMb, err := link.Reader.ReadMultiBuffer()
+ 		if err != nil {
+ 			return
+ 		}
+-		s.timer.Update()
++		timer.Update()
+ 		for i, rb := range resMb {
+ 			b := rb.Bytes()
+ 			if encode != nil {
+@@ -130,12 +205,12 @@ func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest n
+ 				if err != nil {
+ 					continue
+ 				}
+-				if err := s.WriteToClient(encPacket); err != nil {
++				if err := s.writeUDPResponse(link, encPacket); err != nil {
+ 					buf.ReleaseMulti(resMb[i+1:])
+ 					return
+ 				}
+ 			} else {
+-				err := s.WriteToClient(b)
++				err := s.writeUDPResponse(link, b)
+ 				rb.Release()
+ 				if err != nil {
+ 					buf.ReleaseMulti(resMb[i+1:])

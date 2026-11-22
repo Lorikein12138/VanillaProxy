@@ -9,8 +9,14 @@ import (
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 )
 
+const bandwidthOwnershipMarker = "# vanillaproxy-amneziawg-bandwidth-v1"
+
 func ownershipMarker(name string) string {
 	return "# 3x-ui-owned-amneziawg: " + name
+}
+
+func isBandwidthOwnedConfig(config, name string) bool {
+	return strings.HasPrefix(config, ownershipMarker(name)+"\n"+bandwidthOwnershipMarker+"\n")
 }
 
 func parseOwnedInterfaceName(name string) (int, bool) {
@@ -109,7 +115,17 @@ func validOwnedConfig(config, name string) bool {
 	}
 	section := ""
 	interfaceCount := 0
-	for _, line := range strings.Split(config, "\n")[1:] {
+	lines := strings.Split(config, "\n")[1:]
+	if isBandwidthOwnedConfig(config, name) {
+		lines = lines[1:]
+		if strings.HasPrefix(lines[0], bandwidthNATMarker) {
+			if _, ok := parseBandwidthNATLine(lines[0]); !ok {
+				return false
+			}
+			lines = lines[1:]
+		}
+	}
+	for _, line := range lines {
 		switch {
 		case line == "":
 			continue

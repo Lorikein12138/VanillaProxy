@@ -47,6 +47,9 @@ func migrationModels() []any {
 		&model.OutboundTraffics{},
 		&model.InboundClientIps{},
 		&model.ClientRecord{},
+		&model.ClientBandwidth{},
+		&model.RemoteBandwidthProxyBinding{},
+		&model.RemoteBandwidthProxyOwnerPin{},
 		&model.ClientInbound{},
 		&model.ClientHwid{},
 		&model.ClientExternalLink{},
@@ -92,6 +95,11 @@ func MigrateData(srcPath, dstDSN string) error {
 	}
 	defer srcSQL.Close()
 
+	clientSequence, err := sqliteClientSequence(src)
+	if err != nil {
+		return fmt.Errorf("read sqlite client ID sequence: %w", err)
+	}
+
 	dst, err := gorm.Open(postgres.Open(dstDSN), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		return fmt.Errorf("open postgres destination: %w", err)
@@ -112,6 +120,19 @@ func MigrateData(srcPath, dstDSN string) error {
 
 	totalRows := 0
 	txErr := dst.Transaction(func(tx *gorm.DB) error {
+		// Keep the destination's allocation history across TRUNCATE RESTART IDENTITY.
+		if err := tx.Exec("LOCK TABLE clients IN ACCESS EXCLUSIVE MODE").Error; err != nil {
+			return fmt.Errorf("lock postgres clients: %w", err)
+		}
+		dstClientSequence, err := postgresClientSequence(tx)
+		if err != nil {
+			return fmt.Errorf("read postgres client ID sequence: %w", err)
+		}
+		var dstMaxClientID int64
+		if err := tx.Raw("SELECT COALESCE(MAX(id), 0) FROM clients").Row().Scan(&dstMaxClientID); err != nil {
+			return fmt.Errorf("read max postgres client ID: %w", err)
+		}
+
 		// AutoMigrate re-creates the legacy client_traffics -> inbounds foreign key,
 		// but the running panel drops it (see dropLegacyForeignKeys) and tolerates
 		// client_traffics rows whose inbound was deleted. Drop it here too so copying
@@ -137,14 +158,15 @@ func MigrateData(srcPath, dstDSN string) error {
 			totalRows += n
 			log.Printf("  %-32s %d rows", reflect.TypeOf(m).Elem().Name(), n)
 		}
-		return nil
+		// Sequence changes after RESTART IDENTITY are rolled back with the copy.
+		return advancePostgresClientSequence(tx, max(clientSequence, dstClientSequence, dstMaxClientID))
 	})
 	if txErr != nil {
 		return txErr
 	}
 
-	// setval is never rolled back by PostgreSQL, so sequences are resynced only
-	// after the transaction has committed.
+	// The regular resync also fixes sequences for tables whose rows were copied
+	// with explicit IDs.
 	if err := resetPostgresSequences(dst); err != nil {
 		log.Printf("warning: failed to reset some postgres sequences: %v", err)
 	}
@@ -180,6 +202,11 @@ func ExportPostgresToSQLite(srcDSN, dstPath string) error {
 	}
 	defer srcSQL.Close()
 
+	clientSequence, err := postgresClientSequence(src)
+	if err != nil {
+		return fmt.Errorf("read postgres client ID sequence: %w", err)
+	}
+
 	// No WAL: keep all data in the main file so it is complete once closed.
 	dst, err := gorm.Open(sqlite.Open(dstPath+"?_busy_timeout=10000"), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
@@ -191,7 +218,83 @@ func ExportPostgresToSQLite(srcDSN, dstPath string) error {
 	}
 	defer dstSQL.Close()
 
-	return copyAllModels(src, dst)
+	if err := copyAllModels(src, dst); err != nil {
+		return err
+	}
+	// Postgres can allocate client IDs while the export copies model rows.
+	finalClientSequence, err := postgresClientSequence(src)
+	if err != nil {
+		return fmt.Errorf("read postgres client ID sequence after copy: %w", err)
+	}
+	return advanceSQLiteClientSequence(dst, max(clientSequence, finalClientSequence))
+}
+
+func sqliteClientSequence(db *gorm.DB) (int64, error) {
+	var hasSequence bool
+	if err := db.Raw("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence')").
+		Row().Scan(&hasSequence); err != nil || !hasSequence {
+		return 0, err
+	}
+
+	var sequence int64
+	err := db.Raw("SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'clients'").Row().Scan(&sequence)
+	return sequence, err
+}
+
+func advanceSQLiteClientSequence(db *gorm.DB, floor int64) error {
+	if floor <= 0 {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		updated := tx.Exec(`
+			UPDATE sqlite_sequence
+			SET seq = MAX(COALESCE(seq, 0), ?, COALESCE((SELECT MAX(id) FROM clients), 0))
+			WHERE name = 'clients'`, floor)
+		if updated.Error != nil {
+			return fmt.Errorf("advance sqlite client ID sequence: %w", updated.Error)
+		}
+		if updated.RowsAffected == 0 {
+			if err := tx.Exec(`
+				INSERT INTO sqlite_sequence (name, seq)
+				VALUES ('clients', MAX(?, COALESCE((SELECT MAX(id) FROM clients), 0)))`, floor).Error; err != nil {
+				return fmt.Errorf("initialize sqlite client ID sequence: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func postgresClientSequence(db *gorm.DB) (int64, error) {
+	var sequence int64
+	// The catalog returns NULL for an unused sequence. Require read access so
+	// a hidden sequence value cannot silently discard allocation history.
+	err := db.Raw(`
+		SELECT CASE
+			WHEN seq IS NULL THEN 0
+			WHEN pg_catalog.has_sequence_privilege(seq, 'USAGE, SELECT')
+				THEN COALESCE(pg_catalog.pg_sequence_last_value(seq), 0)
+		END
+		FROM (SELECT pg_catalog.pg_get_serial_sequence('clients', 'id')::regclass AS seq) AS owned`).
+		Row().Scan(&sequence)
+	return sequence, err
+}
+
+func advancePostgresClientSequence(tx *gorm.DB, floor int64) error {
+	current, err := postgresClientSequence(tx)
+	if err != nil {
+		return fmt.Errorf("read postgres client ID sequence: %w", err)
+	}
+	err = tx.Exec(`
+		SELECT pg_catalog.setval(seq, high_water, true)
+		FROM (
+			SELECT pg_catalog.pg_get_serial_sequence('clients', 'id')::regclass AS seq,
+				GREATEST(COALESCE((SELECT MAX(id) FROM clients), 0), ?::bigint) AS high_water
+		) AS target
+		WHERE seq IS NOT NULL AND high_water > ?`, floor, current).Error
+	if err != nil {
+		return fmt.Errorf("advance postgres client ID sequence: %w", err)
+	}
+	return nil
 }
 
 // copyAllModels (re)creates the schema on dst and copies every migrated table
@@ -288,12 +391,24 @@ func resetPostgresSequences(dst *gorm.DB) error {
 	return resyncPostgresSequences(dst, migrationModels())
 }
 
-// resyncPostgresSequences sets each model's id sequence to MAX(id); idempotent. Id-less
-// composite-PK tables are skipped — Postgres rejects MAX(id) at parse time and logs it (#5665).
+// resyncPostgresSequences resyncs each model's id sequence with MAX(id).
+// Id-less composite-PK tables are skipped (#5665).
 func resyncPostgresSequences(db *gorm.DB, models []any) error {
 	for _, m := range models {
 		t, ok := tableWithIdColumn(db, m)
 		if !ok {
+			continue
+		}
+		if t == "clients" {
+			// Serialize with normal client inserts while checking and advancing the sequence.
+			if err := db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Exec("LOCK TABLE clients IN SHARE ROW EXCLUSIVE MODE").Error; err != nil {
+					return err
+				}
+				return advancePostgresClientSequence(tx, 0)
+			}); err != nil {
+				return err
+			}
 			continue
 		}
 		// t comes from the trusted model set parsed by GORM, not user input, so
@@ -341,9 +456,19 @@ func PrepareSQLiteForMigration(dbPath string) error {
 			return fmt.Errorf("not a 3x-ui panel database: required table %q is missing", table)
 		}
 	}
+	clientSequence, err := sqliteClientSequence(gdb)
+	if err != nil {
+		return fmt.Errorf("read sqlite client ID sequence: %w", err)
+	}
 	for _, m := range migrationModels() {
 		if err := gdb.AutoMigrate(m); err != nil && !isIgnorableDuplicateColumnErr(gdb, err, m) {
 			return fmt.Errorf("upgrade panel schema for %T: %w", m, err)
+		}
+		if _, ok := m.(*model.ClientRecord); ok {
+			// SQLite AutoMigrate can rebuild clients from its surviving rows.
+			if err := advanceSQLiteClientSequence(gdb, clientSequence); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

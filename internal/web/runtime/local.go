@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +23,11 @@ import (
 )
 
 type LocalDeps struct {
-	APIPort          func() int
-	SetNeedRestart   func()
-	RequestReconcile func()
+	APIPort                  func() int
+	SetNeedRestart           func()
+	RequestReconcile         func()
+	ReconcileKernelAmneziaWG func() error
+	BandwidthManaged         bool
 }
 
 type Local struct {
@@ -37,6 +40,91 @@ func NewLocal(deps LocalDeps) *Local {
 }
 
 func (l *Local) Name() string { return "local" }
+
+// ValidateBandwidthInbound rejects inbounds that cannot join the managed data
+// plane. Disabled rows can still be edited or removed.
+func ValidateBandwidthInbound(ib *model.Inbound) error {
+	if ib == nil || !ib.Enable || ib.NodeID != nil {
+		return nil
+	}
+	switch ib.Protocol {
+	case model.VLESS, model.VMESS, model.Hysteria, model.Trojan, model.Shadowsocks,
+		model.HTTP, model.Mixed, model.MASQUE, model.WireGuard:
+		return nil
+	case model.MTProto:
+		var settings struct {
+			RouteThroughXray bool `json:"routeThroughXray"`
+		}
+		if json.Unmarshal([]byte(ib.Settings), &settings) == nil && !settings.RouteThroughXray {
+			return nil
+		}
+	case model.TUIC:
+		var settings map[string]json.RawMessage
+		inst, ok := tuic.InstanceFromInbound(ib)
+		if json.Unmarshal([]byte(ib.Settings), &settings) == nil && ok &&
+			(len(settings["clients"]) != 0 || len(settings["server"]) != 0 ||
+				(inst.Certificate != "" && inst.PrivateKey != "")) && tuic.ValidateClients(inst.Clients) == nil {
+			for _, client := range inst.Clients {
+				if err := tuic.ValidateRelayEmail(client.Email); err != nil {
+					return fmt.Errorf("bandwidth-managed node TUIC inbound %q: %w", ib.Tag, err)
+				}
+			}
+			return nil
+		}
+	case model.AmneziaWG:
+		var settings amneziawg.InboundSettings
+		if json.Unmarshal([]byte(ib.Settings), &settings) != nil || settings.Server == nil {
+			break
+		}
+		inst := amneziawg.Instance{
+			Listen:           ib.Listen,
+			IPv6Enabled:      settings.Server.IPv6Enabled,
+			RouteThroughXray: settings.Server.RouteThroughXray,
+		}
+		for _, peer := range settings.Clients {
+			if peer.ForwardedPorts != "" {
+				return fmt.Errorf("bandwidth-managed node does not support public AmneziaWG port forwards on inbound %q", ib.Tag)
+			}
+			if settings.Server.KernelMode && peer.Enable {
+				inst.Peers = append(inst.Peers, amneziawg.Peer{AllowedIPs: peer.AllowedIPs})
+			}
+		}
+		if settings.Server.KernelMode {
+			if err := amneziawgkern.ValidateInstanceFeatures(inst, inst.RouteThroughXray); err != nil {
+				return fmt.Errorf("bandwidth-managed node AmneziaWG inbound %q: %w", ib.Tag, err)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("bandwidth-managed node does not support enabled local inbound %q using %s in this configuration", ib.Tag, ib.Protocol)
+}
+
+func (l *Local) reconcileBandwidthInbound(inbounds ...*model.Inbound) error {
+	if l.deps.RequestReconcile != nil {
+		l.deps.RequestReconcile()
+	}
+	return l.reconcileBandwidthKernel(inbounds...)
+}
+
+func kernelAmneziaWGInbound(ib *model.Inbound) bool {
+	if ib == nil || ib.Protocol != model.AmneziaWG || ib.NodeID != nil {
+		return false
+	}
+	var settings amneziawg.InboundSettings
+	return json.Unmarshal([]byte(ib.Settings), &settings) == nil && settings.Server != nil && settings.Server.KernelMode
+}
+
+func (l *Local) reconcileBandwidthKernel(inbounds ...*model.Inbound) error {
+	for _, ib := range inbounds {
+		if kernelAmneziaWGInbound(ib) {
+			if l.deps.ReconcileKernelAmneziaWG == nil {
+				return errors.New("bandwidth-managed node is missing the kernel AmneziaWG reconciler")
+			}
+			return l.deps.ReconcileKernelAmneziaWG()
+		}
+	}
+	return nil
+}
 
 func (l *Local) withAPI(fn func(api *xray.XrayAPI) error) error {
 	l.mu.Lock()
@@ -65,6 +153,14 @@ func (l *Local) withAPI(fn func(api *xray.XrayAPI) error) error {
 }
 
 func (l *Local) AddInbound(_ context.Context, ib *model.Inbound) error {
+	if l.deps.BandwidthManaged {
+		if err := ValidateBandwidthInbound(ib); err != nil {
+			return err
+		}
+		if !ib.Enable || ib.Protocol != model.MTProto {
+			return l.reconcileBandwidthInbound(ib)
+		}
+	}
 	if ib.Protocol == model.MTProto {
 		inst, ok := mtproto.InstanceFromInbound(ib)
 		if !ok {
@@ -109,6 +205,10 @@ func (l *Local) AddInbound(_ context.Context, ib *model.Inbound) error {
 }
 
 func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
+	if l.deps.BandwidthManaged && ib.Protocol != model.MTProto {
+		stopManagedRelaySidecar(ib)
+		return l.reconcileBandwidthInbound(ib)
+	}
 	if ib.Protocol == model.MTProto {
 		mtproto.GetManager().Remove(ib.Id)
 		return nil
@@ -136,6 +236,42 @@ func (l *Local) DelInbound(_ context.Context, ib *model.Inbound) error {
 }
 
 func (l *Local) UpdateInbound(ctx context.Context, oldIb, newIb *model.Inbound) error {
+	if l.deps.BandwidthManaged {
+		if err := ValidateBandwidthInbound(newIb); err != nil {
+			// Ensure also rejects unsupported MTProto settings and tears down an
+			// old managed process when its new policy cannot be applied.
+			if oldIb.Protocol == model.MTProto {
+				mtproto.GetManager().Remove(oldIb.Id)
+			}
+			stopManagedRelaySidecar(oldIb)
+			return errors.Join(err, l.reconcileBandwidthKernel(oldIb, newIb))
+		}
+		if !newIb.Enable || oldIb.Protocol != newIb.Protocol || oldIb.Settings != newIb.Settings ||
+			oldIb.Port != newIb.Port || oldIb.Listen != newIb.Listen || oldIb.Tag != newIb.Tag {
+			stopManagedRelaySidecar(oldIb)
+		}
+		if oldIb.Protocol == model.MTProto && kernelAmneziaWGInbound(newIb) {
+			// Avoid claiming the new kernel UDP port before the old sidecar exits.
+			mtproto.GetManager().Remove(oldIb.Id)
+		}
+		kernelErr := l.reconcileBandwidthKernel(oldIb, newIb)
+		if oldIb.Protocol != model.MTProto && newIb.Protocol != model.MTProto {
+			l.reconcileBandwidthInbound()
+			return kernelErr
+		}
+		if oldIb.Protocol != newIb.Protocol {
+			l.reconcileBandwidthInbound()
+		}
+		if kernelErr != nil {
+			return kernelErr
+		}
+		if newIb.Protocol == model.AmneziaWG || newIb.Protocol == model.TUIC {
+			if oldIb.Protocol == model.MTProto {
+				mtproto.GetManager().Remove(oldIb.Id)
+			}
+			return nil
+		}
+	}
 	if oldIb.Protocol == model.MTProto || newIb.Protocol == model.MTProto {
 		return l.updateMtprotoInbound(ctx, oldIb, newIb)
 	}
@@ -150,6 +286,15 @@ func (l *Local) UpdateInbound(ctx context.Context, oldIb, newIb *model.Inbound) 
 		return nil
 	}
 	return l.AddInbound(ctx, newIb)
+}
+
+func stopManagedRelaySidecar(inbound *model.Inbound) {
+	switch inbound.Protocol {
+	case model.AmneziaWG:
+		amneziawgnet.GetManager().Remove(inbound.Id)
+	case model.TUIC:
+		tuic.GetManager().Remove(inbound.Id)
+	}
 }
 
 // updateMtprotoInbound applies an inbound update without the Del+Add sequence
@@ -274,6 +419,12 @@ func (l *Local) updateTuicInbound(ctx context.Context, oldIb, newIb *model.Inbou
 }
 
 func (l *Local) AddUser(_ context.Context, ib *model.Inbound, userMap map[string]any) error {
+	if l.deps.BandwidthManaged {
+		if err := ValidateBandwidthInbound(ib); err != nil {
+			return err
+		}
+		return l.reconcileBandwidthInbound(ib)
+	}
 	if ib.Protocol == model.TUIC {
 		if l.deps.RequestReconcile != nil {
 			l.deps.RequestReconcile()
@@ -289,6 +440,9 @@ func (l *Local) AddUser(_ context.Context, ib *model.Inbound, userMap map[string
 }
 
 func (l *Local) RemoveUser(_ context.Context, ib *model.Inbound, email string) error {
+	if l.deps.BandwidthManaged {
+		return l.reconcileBandwidthInbound(ib)
+	}
 	if ib.Protocol == model.TUIC {
 		if l.deps.RequestReconcile != nil {
 			l.deps.RequestReconcile()

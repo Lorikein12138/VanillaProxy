@@ -69,6 +69,26 @@ export function coerceInboundJsonField(value: unknown): Record<string, unknown> 
   }
 }
 
+export function stripProxyBandwidthClientIds(protocol: string, settings: Record<string, unknown>) {
+  if (protocol !== Protocols.HTTP && protocol !== Protocols.MIXED) return settings;
+  let result = settings;
+  for (const key of ['accounts', 'users']) {
+    const accounts = settings[key];
+    if (!Array.isArray(accounts)) continue;
+    let changed = false;
+    const cleaned = accounts.map((account: unknown) => {
+      if (!account || typeof account !== 'object' || !('bandwidthClientId' in account)) {
+        return account;
+      }
+      const { bandwidthClientId: _id, ...portable } = account;
+      changed = true;
+      return portable;
+    });
+    if (changed) result = { ...result, [key]: cleaned };
+  }
+  return result;
+}
+
 export class DBInbound {
   id: number;
   userId: number;

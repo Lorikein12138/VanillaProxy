@@ -65,6 +65,26 @@ export interface Section {
   endpoints: Endpoint[];
 }
 
+const bandwidthRateSchema = {
+  type: 'integer',
+  format: 'int64',
+  minimum: 0,
+  maximum: Number.MAX_SAFE_INTEGER,
+};
+const bandwidthPolicyProperties = {
+  totalBitsPerSecond: bandwidthRateSchema,
+  nodeBitsPerSecond: { type: 'object', additionalProperties: bandwidthRateSchema },
+};
+const bandwidthPolicyResponseSchema = {
+  type: 'object',
+  properties: {
+    ...bandwidthPolicyProperties,
+    available: { type: 'boolean' },
+    accountNodeKeys: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['totalBitsPerSecond', 'nodeBitsPerSecond', 'available'],
+};
+
 // /inbounds/update replaces the whole row, so it takes the same payload as /add.
 const inboundBody =
   '{\n  "enable": true,\n  "remark": "VLESS-443",\n  "listen": "",\n  "port": 443,\n  "protocol": "vless",\n  "expiryTime": 0,\n  "total": 0,\n  "settings": {\n    "clients": [{ "id": "...", "email": "user1" }],\n    "decryption": "none",\n    "fallbacks": []\n  },\n  "streamSettings": {\n    "network": "tcp",\n    "security": "reality",\n    "realitySettings": { "show": false, "dest": "..." }\n  },\n  "sniffing": {\n    "enabled": true,\n    "destOverride": ["http", "tls"]\n  }\n}';
@@ -1148,6 +1168,36 @@ export const sections: readonly Section[] = [
         ],
         response:
           '{\n  "success": true,\n  "obj": {\n    "client": { "id": 1, "email": "alice@example.com", ... },\n    "inboundIds": [3, 5],\n    "externalLinks": [\n      { "id": 11, "kind": "link", "value": "vless://...", "remark": "DE", "enable": true, "expiryTime": 0 },\n      { "id": 12, "kind": "subscription", "value": "https://provider.example/sub/abc", "remark": "Provider", "enable": false, "expiryTime": 1767225600000, "namePrefix": "[zjh] ", "lastFetchAt": 1767220000000, "lastFetchError": "" }\n    ]\n  }\n}',
+      },
+      {
+        method: 'GET',
+        path: '/panel/api/clients/:email/bandwidth',
+        summary: 'Read the bandwidth policy for a client.',
+        description:
+          'Rates are nonnegative integer bits per second. A total of zero inherits the startup quota. An omitted node inherits its default, while an explicit node rate of zero removes its extra cap. Saved overrides for detached nodes are also returned so they can be restored on reattachment.',
+        params: [
+          { name: 'email', in: 'path', type: 'string', desc: 'Client email (URL-encoded).' },
+        ],
+        responseObjectSchema: bandwidthPolicyResponseSchema,
+        response:
+          '{\n  "success": true,\n  "obj": {\n    "available": true,\n    "totalBitsPerSecond": 20000000,\n    "nodeBitsPerSecond": { "local": 0 }\n  }\n}',
+      },
+      {
+        method: 'POST',
+        path: '/panel/api/clients/:email/bandwidth',
+        summary: 'Set the bandwidth policy for a client and its associated nodes.',
+        description:
+          'Use bandwidthNodeKey values for currently attached nodes. Saved overrides for detached nodes are retained and returned. For a positive total cap, each submitted node cap must be less than or equal to that total. The policy can be saved even when the response reports that the client is outside the running bandwidth limiter.',
+        params: [
+          { name: 'email', in: 'path', type: 'string', desc: 'Client email (URL-encoded).' },
+        ],
+        requestSchema: {
+          type: 'object',
+          properties: bandwidthPolicyProperties,
+          required: ['totalBitsPerSecond', 'nodeBitsPerSecond'],
+        },
+        body: '{\n  "totalBitsPerSecond": 20000000,\n  "nodeBitsPerSecond": { "local": 0 }\n}',
+        responseObjectSchema: bandwidthPolicyResponseSchema,
       },
       {
         method: 'GET',

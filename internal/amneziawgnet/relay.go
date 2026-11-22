@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,9 @@ type SocksRelay struct {
 	// caller generates or displays it, so it's never mistaken later for a
 	// real credential.
 	Password string
+	// RequireBoundUDP forces password authentication for TCP and UDP, and
+	// binds a UDP association to the loopback socket declared to Xray.
+	RequireBoundUDP bool
 }
 
 // SocksInboundSettings builds the JSON `settings` block for a stock Xray
@@ -68,13 +72,7 @@ func SocksInboundSettings(emails []string, password string) ([]byte, error) {
 func (r SocksRelay) RelayTCP(conn *gonet.TCPConn, email string, dest netip.AddrPort) {
 	defer conn.Close()
 
-	auth := &proxy.Auth{User: email, Password: r.Password}
-	dialer, err := proxy.SOCKS5("tcp", r.Addr, auth, proxy.Direct)
-	if err != nil {
-		logger.Warningf("amneziawgnet: RelayTCP: build SOCKS5 dialer: %v", err)
-		return
-	}
-	upstream, err := dialer.Dial("tcp", dest.String())
+	upstream, err := r.dialTCP(email, dest)
 	if err != nil {
 		logger.Warningf("amneziawgnet: RelayTCP: SOCKS5 CONNECT to %s as %q: %v", dest, email, err)
 		return
@@ -82,6 +80,34 @@ func (r SocksRelay) RelayTCP(conn *gonet.TCPConn, email string, dest netip.AddrP
 	defer upstream.Close()
 
 	pipeBothWays(conn, upstream)
+}
+
+func (r SocksRelay) dialTCP(email string, dest netip.AddrPort) (net.Conn, error) {
+	if r.RequireBoundUDP {
+		if !dest.IsValid() || dest.Addr().Zone() != "" {
+			return nil, fmt.Errorf("amneziawgnet: invalid SOCKS5 CONNECT destination %s", dest)
+		}
+		conn, err := r.dialAuthenticated(email)
+		if err != nil {
+			return nil, err
+		}
+		if err := socks5Request(conn, 0x01, dest); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if _, err := readSocks5Reply(conn, true); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		_ = conn.SetDeadline(time.Time{})
+		return conn, nil
+	}
+	auth := &proxy.Auth{User: email, Password: r.Password}
+	dialer, err := proxy.SOCKS5("tcp", r.Addr, auth, proxy.Direct)
+	if err != nil {
+		return nil, err
+	}
+	return dialer.Dial("tcp", dest.String())
 }
 
 // halfCloseIdle bounds how long the surviving direction of a half-closed pair
@@ -139,60 +165,137 @@ func pipeBothWays(a, b net.Conn) {
 // the TCP control connection that must stay open for the session's
 // lifetime -- per RFC 1928, closing it tears the association down.
 type socks5UDPSession struct {
-	ctrl    net.Conn
-	udpConn *net.UDPConn
+	ctrl       net.Conn
+	udpConn    *net.UDPConn
+	boundRelay netip.AddrPort
+	closed     atomic.Bool
 }
 
 // Bounds dial plus the greeting/auth/associate reads: an accepted-but-silent
 // server otherwise parks Handle, and with it the tunnel's delivery path.
 var socks5AssociateTimeout = 5 * time.Second
 
-// newSocks5UDPSession performs the SOCKS5 greeting, username/password auth,
+// newUDPSession performs the SOCKS5 greeting, username/password auth,
 // and UDP ASSOCIATE request/reply by hand: golang.org/x/net/proxy's SOCKS5
 // client (used by RelayTCP above) only implements CONNECT, and xray-core's
 // own proxy/socks/client.go is written against its internal transport
 // types, not reusable as a standalone dialer -- so this is a small, direct,
 // from-the-RFC implementation rather than an existing library call.
-func newSocks5UDPSession(addr, user, password string) (*socks5UDPSession, error) {
+func (r SocksRelay) newUDPSession(user string) (*socks5UDPSession, error) {
+	ctrl, err := r.dialAuthenticated(user)
+	if err != nil {
+		return nil, err
+	}
+	sess := &socks5UDPSession{ctrl: ctrl}
+	ready := false
+	defer func() {
+		if !ready {
+			sess.Close()
+		}
+	}()
+
+	// Stock SOCKS5 uses 0.0.0.0:0, allowing Xray to learn the source port.
+	// Strict mode announces the actual socket from the authenticated TCP
+	// connection, allowing Xray to require that exact source endpoint.
+	source := netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
+	if r.RequireBoundUDP {
+		localIP := ctrl.LocalAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		sess.udpConn, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(localIP, 0)))
+		if err != nil {
+			return nil, fmt.Errorf("amneziawgnet: bind UDP association socket: %w", err)
+		}
+		source = sess.udpConn.LocalAddr().(*net.UDPAddr).AddrPort()
+	}
+	if err := socks5Request(ctrl, 0x03, source); err != nil {
+		return nil, err
+	}
+	bind, err := readSocks5Reply(ctrl, r.RequireBoundUDP)
+	if err != nil {
+		return nil, err
+	}
+	if r.RequireBoundUDP {
+		relayIP := ctrl.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		if bind.Addr().Unmap() != relayIP || bind.Port() == 0 {
+			return nil, fmt.Errorf("amneziawgnet: unexpected bound UDP relay endpoint %s", bind)
+		}
+		sess.boundRelay = netip.AddrPortFrom(relayIP, bind.Port())
+	} else {
+		sess.udpConn, err = net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bind))
+		if err != nil {
+			return nil, fmt.Errorf("amneziawgnet: dial SOCKS5 UDP relay endpoint %s: %w", bind, err)
+		}
+	}
+	_ = ctrl.SetDeadline(time.Time{})
+	ready = true
+	if r.RequireBoundUDP {
+		go sess.watchControl()
+	}
+	return sess, nil
+}
+
+func (r SocksRelay) dialAuthenticated(user string) (net.Conn, error) {
+	if r.RequireBoundUDP {
+		if err := r.validateBoundRelay(); err != nil {
+			return nil, err
+		}
+		if !validRelayEmail(user) {
+			return nil, fmt.Errorf("amneziawgnet: SOCKS5 username must contain 1 to 255 bytes")
+		}
+	}
 	deadline := time.Now().Add(socks5AssociateTimeout)
 	dialer := net.Dialer{Deadline: deadline}
-	ctrl, err := dialer.DialContext(context.Background(), "tcp", addr)
+	ctrl, err := dialer.DialContext(context.Background(), "tcp", r.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("amneziawgnet: dial SOCKS5 control connection: %w", err)
 	}
 	_ = ctrl.SetDeadline(deadline)
-	if err := socks5Handshake(ctrl, user, password); err != nil {
+	if err := socks5Handshake(ctrl, user, r.Password, r.RequireBoundUDP); err != nil {
 		ctrl.Close()
 		return nil, err
 	}
+	return ctrl, nil
+}
 
-	// UDP ASSOCIATE, dst 0.0.0.0:0 ("I don't know my own source yet, and I
-	// don't need to specify one for a loopback relay").
-	if _, err := ctrl.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("amneziawgnet: send UDP ASSOCIATE request: %w", err)
+func (r SocksRelay) validateBoundRelay() error {
+	endpoint, err := netip.ParseAddrPort(r.Addr)
+	if err != nil || endpoint.Addr().Zone() != "" || !endpoint.Addr().Unmap().IsLoopback() || endpoint.Port() == 0 {
+		return fmt.Errorf("amneziawgnet: bound relay requires a loopback IP and port")
 	}
-	bind, err := readSocks5Reply(ctrl)
-	if err != nil {
-		ctrl.Close()
-		return nil, err
+	if len(r.Password) == 0 || len(r.Password) > 255 || strings.HasPrefix(r.Password, "amneziawgnet-fallback-") {
+		return fmt.Errorf("amneziawgnet: secure SOCKS relay password unavailable")
 	}
-	_ = ctrl.SetDeadline(time.Time{})
+	return nil
+}
 
-	udpConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bind))
-	if err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("amneziawgnet: dial SOCKS5 UDP relay endpoint %s: %w", bind, err)
+func validRelayEmail(email string) bool {
+	return len(email) > 0 && len(email) <= 255
+}
+
+func socks5Request(conn net.Conn, command byte, address netip.AddrPort) error {
+	var req [22]byte
+	req[0], req[1], req[3] = 0x05, command, 0x01
+	ip := address.Addr().Unmap()
+	if ip.Is6() {
+		req[3] = 0x04
 	}
-	return &socks5UDPSession{ctrl: ctrl, udpConn: udpConn}, nil
+	n := 4 + copy(req[4:], ip.AsSlice())
+	binary.BigEndian.PutUint16(req[n:], address.Port())
+	if _, err := conn.Write(req[:n+2]); err != nil {
+		return fmt.Errorf("amneziawgnet: send SOCKS5 command %d: %w", command, err)
+	}
+	return nil
 }
 
 // socks5Handshake performs the version greeting and (if the server
 // requires it) username/password auth. Xray's SOCKS5 inbound with
 // auth:"password" always requires it; the no-auth branch exists so this
 // helper isn't silently wrong against a differently-configured server.
-func socks5Handshake(conn net.Conn, user, password string) error {
-	if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+func socks5Handshake(conn net.Conn, user, password string, requirePassword bool) error {
+	greeting := []byte{0x05, 0x02, 0x00, 0x02}
+	if requirePassword {
+		greeting = []byte{0x05, 0x01, 0x02}
+	}
+	if _, err := conn.Write(greeting); err != nil {
 		return fmt.Errorf("amneziawgnet: send SOCKS5 greeting: %w", err)
 	}
 	var resp [2]byte
@@ -201,6 +304,9 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 	}
 	if resp[0] != 0x05 {
 		return fmt.Errorf("amneziawgnet: unexpected SOCKS5 version %d", resp[0])
+	}
+	if requirePassword && resp[1] != 0x02 {
+		return fmt.Errorf("amneziawgnet: SOCKS5 password authentication required, selected method %d", resp[1])
 	}
 	switch resp[1] {
 	case 0x00: // no auth required
@@ -218,6 +324,9 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 		if _, err := io.ReadFull(conn, authResp[:]); err != nil {
 			return fmt.Errorf("amneziawgnet: read SOCKS5 auth reply: %w", err)
 		}
+		if requirePassword && authResp[0] != 0x01 {
+			return fmt.Errorf("amneziawgnet: unexpected SOCKS5 auth version %d", authResp[0])
+		}
 		if authResp[1] != 0x00 {
 			return fmt.Errorf("amneziawgnet: SOCKS5 auth rejected (status %d)", authResp[1])
 		}
@@ -229,7 +338,7 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 
 // readSocks5Reply reads a SOCKS5 reply (the common format shared by CONNECT
 // and UDP ASSOCIATE replies) and returns its bound address.
-func readSocks5Reply(r io.Reader) (netip.AddrPort, error) {
+func readSocks5Reply(r io.Reader, requireIP bool) (netip.AddrPort, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("amneziawgnet: read SOCKS5 reply header: %w", err)
@@ -239,6 +348,9 @@ func readSocks5Reply(r io.Reader) (netip.AddrPort, error) {
 	}
 	if hdr[1] != 0x00 {
 		return netip.AddrPort{}, fmt.Errorf("amneziawgnet: SOCKS5 request failed (reply code %d)", hdr[1])
+	}
+	if requireIP && (hdr[2] != 0 || (hdr[3] != 0x01 && hdr[3] != 0x04)) {
+		return netip.AddrPort{}, fmt.Errorf("amneziawgnet: invalid SOCKS5 relay reply for bound connection")
 	}
 	addr, err := readSocks5Addr(r, hdr[3])
 	if err != nil {
@@ -295,8 +407,20 @@ func readSocks5Addr(r io.Reader, atyp byte) (netip.Addr, error) {
 // Close ends the UDP ASSOCIATE session: closing ctrl tells the SOCKS5
 // server to tear down its relay side too (RFC 1928).
 func (s *socks5UDPSession) Close() error {
-	s.udpConn.Close()
+	if s.closed.Swap(true) {
+		return nil
+	}
+	if s.udpConn != nil {
+		s.udpConn.Close()
+	}
 	return s.ctrl.Close()
+}
+
+func (s *socks5UDPSession) watchControl() {
+	// SOCKS5 sends no control data after UDP ASSOCIATE succeeds.
+	var buf [1]byte
+	_, _ = s.ctrl.Read(buf[:])
+	_ = s.Close()
 }
 
 // sendTo wraps payload in a SOCKS5 UDP request header addressed to dest and
@@ -317,6 +441,10 @@ func (s *socks5UDPSession) sendTo(dest netip.AddrPort, payload []byte) error {
 	binary.BigEndian.PutUint16(portBytes[:], dest.Port())
 	hdr = append(hdr, portBytes[:]...)
 	hdr = append(hdr, payload...)
+	if s.boundRelay.IsValid() {
+		_, err := s.udpConn.WriteToUDPAddrPort(hdr, s.boundRelay)
+		return err
+	}
 	_, err := s.udpConn.Write(hdr)
 	return err
 }
@@ -325,13 +453,16 @@ func (s *socks5UDPSession) sendTo(dest netip.AddrPort, payload []byte) error {
 // SOCKS5 server says it came from and the actual payload (a sub-slice of
 // buf -- valid only until the next receive call).
 func (s *socks5UDPSession) receive(buf []byte) (netip.AddrPort, []byte, error) {
-	n, err := s.udpConn.Read(buf)
+	n, err := s.readUDP(buf)
 	if err != nil {
 		return netip.AddrPort{}, nil, err
 	}
 	data := buf[:n]
 	if len(data) < 4 {
 		return netip.AddrPort{}, nil, fmt.Errorf("amneziawgnet: short SOCKS5 UDP reply (%d bytes)", n)
+	}
+	if s.boundRelay.IsValid() && (data[0] != 0 || data[1] != 0 || data[2] != 0) {
+		return netip.AddrPort{}, nil, fmt.Errorf("amneziawgnet: invalid SOCKS5 UDP relay header")
 	}
 	addr, rest, err := splitSocks5Addr(data[4:], data[3])
 	if err != nil {
@@ -341,6 +472,22 @@ func (s *socks5UDPSession) receive(buf []byte) (netip.AddrPort, []byte, error) {
 		return netip.AddrPort{}, nil, fmt.Errorf("amneziawgnet: truncated SOCKS5 UDP reply port")
 	}
 	return netip.AddrPortFrom(addr, binary.BigEndian.Uint16(rest[:2])), rest[2:], nil
+}
+
+func (s *socks5UDPSession) readUDP(buf []byte) (int, error) {
+	if !s.boundRelay.IsValid() {
+		return s.udpConn.Read(buf)
+	}
+	for {
+		n, source, err := s.udpConn.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			return n, err
+		}
+		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+		if source == s.boundRelay {
+			return n, nil
+		}
+	}
 }
 
 // splitSocks5Addr decodes the address at the head of b for address type atyp
@@ -386,6 +533,7 @@ type UDPRelay struct {
 	// session map: src.String() would allocate on every relayed datagram.
 	mu       sync.Mutex
 	sessions map[netip.AddrPort]*socks5UDPSession
+	closed   bool
 }
 
 // NewUDPRelay creates a UDPRelay for one embedded AmneziaWG Device's stack.
@@ -400,16 +548,25 @@ func NewUDPRelay(relay SocksRelay, gstack *stack.Stack) *UDPRelay {
 // reusing it for subsequent packets from the same src.
 func (u *UDPRelay) Handle(src, dst netip.AddrPort, email string, payload []byte) {
 	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return
+	}
 	sess, ok := u.sessions[src]
 	u.mu.Unlock()
 
 	if !ok {
-		fresh, err := newSocks5UDPSession(u.relay.Addr, email, u.relay.Password)
+		fresh, err := u.relay.newUDPSession(email)
 		if err != nil {
 			logger.Warningf("amneziawgnet: UDPRelay: SOCKS5 associate for %q: %v", email, err)
 			return
 		}
 		u.mu.Lock()
+		if u.closed {
+			u.mu.Unlock()
+			fresh.Close()
+			return
+		}
 		// Associating happens off-lock, so a concurrent Handle for the same src
 		// may already have published one; keep it, so the key has a single pump.
 		if existing, dup := u.sessions[src]; dup {
@@ -460,6 +617,7 @@ func (u *UDPRelay) pump(src netip.AddrPort, sess *socks5UDPSession) {
 func (u *UDPRelay) Close() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.closed = true
 	for k, s := range u.sessions {
 		s.Close()
 		delete(u.sessions, k)

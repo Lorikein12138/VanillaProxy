@@ -119,6 +119,34 @@ describe('rawInboundToFormValues', () => {
     const result = InboundFormSchema.safeParse(values);
     expect(result.success).toBe(true);
   });
+
+  it.each(['http', 'mixed'])(
+    'preserves explicit %s proxy ownership when editing a users alias',
+    (protocol) => {
+      const users = [
+        { user: 'mapped', pass: 'secret', bandwidthClientId: 15 },
+        { user: 'legacy', pass: 'legacy-secret' },
+      ];
+      const row: RawInboundRow = {
+        ...vlessRow,
+        protocol,
+        settings: { users, ...(protocol === 'mixed' && { auth: 'password' }) },
+      };
+      const values = InboundFormSchema.parse(rawInboundToFormValues(row));
+      const saved = JSON.parse(formValuesToWirePayload(values).settings);
+
+      expect(saved.accounts).toEqual(users);
+      expect(saved).not.toHaveProperty('users');
+      expect(row.settings).not.toHaveProperty('accounts');
+
+      const remote = InboundFormSchema.parse(rawInboundToFormValues({ ...row, nodeId: 5 }));
+      const remoteSaved = JSON.parse(formValuesToWirePayload(remote).settings);
+      expect(remoteSaved.accounts).toEqual([
+        { user: 'mapped', pass: 'secret' },
+        { user: 'legacy', pass: 'legacy-secret' },
+      ]);
+    },
+  );
 });
 
 // Regression: wireguard (UDP-only) and tunnel (dokodemo-door) have no

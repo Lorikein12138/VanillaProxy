@@ -1586,6 +1586,12 @@ func (s *ServerService) GetConfigJson() (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if activeBandwidthNode.Load() != nil {
+		config = cloneBandwidthXrayConfig(config)
+		if err := redactBandwidthSidecarCredentials(config); err != nil {
+			return nil, err
+		}
+	}
 	contents, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return nil, err

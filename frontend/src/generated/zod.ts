@@ -818,6 +818,7 @@ export type InboundFallback = z.infer<typeof InboundFallbackSchema>;
 
 export const InboundOptionSchema = z.object({
   awgServer: z.lazy(() => ServerSettingsSchema).nullable().optional(),
+  bandwidthNodeKey: z.string(),
   enable: z.boolean(),
   id: z.number().int(),
   listen: z.string().optional(),

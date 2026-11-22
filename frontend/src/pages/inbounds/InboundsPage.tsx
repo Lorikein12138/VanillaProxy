@@ -33,7 +33,11 @@ import {
 } from '@/lib/xray/inbound-link';
 import { inboundFromDb } from '@/lib/xray/inbound-from-db';
 import { Protocols } from '@/schemas/primitives';
-import { coerceInboundJsonField, type DBInbound } from '@/models/dbinbound';
+import {
+  coerceInboundJsonField,
+  stripProxyBandwidthClientIds,
+  type DBInbound,
+} from '@/models/dbinbound';
 import { useTheme } from '@/hooks/useTheme';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -378,9 +382,13 @@ export default function InboundsPage() {
 
   const exportInboundClipboard = useCallback(
     (dbInbound: DBInbound) => {
+      const settings = coerceInboundJsonField(dbInbound.settings);
+      const portable = stripProxyBandwidthClientIds(dbInbound.protocol, settings);
+      const inbound =
+        settings === portable ? dbInbound : { ...dbInbound, settings: JSON.stringify(portable) };
       openText({
         title: t('pages.inbounds.inboundJsonTitle'),
-        content: JSON.stringify(dbInbound, null, 2),
+        content: JSON.stringify(inbound, null, 2),
         json: true,
       });
     },

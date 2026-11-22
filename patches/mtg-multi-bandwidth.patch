@@ -1,0 +1,768 @@
+diff --git a/internal/cli/run.go b/internal/cli/run.go
+index 332a996f61300d5c6d249cf41a5aa428d332d8ab..2bc1fea1517997b8f75799c1b02a67da67b594d3 100644
+--- a/internal/cli/run.go
++++ b/internal/cli/run.go
+@@ -2,12 +2,16 @@ package cli
+ 
+ import (
+ 	"fmt"
++	"os"
+ 
+ 	"github.com/mhsanaei/mtg-multi/internal/utils"
++	launch "github.com/mhsanaei/mtg-multi/internal/vanillalaunch"
++	"github.com/mhsanaei/mtg-multi/mtglib"
+ )
+ 
+ type Run struct {
+-	ConfigPath string `kong:"arg,required,type='existingfile',help='Path to the configuration file.',name='config-path'"` //nolint: lll
++	ConfigPath       string `kong:"arg,required,type='existingfile',help='Path to the configuration file.',name='config-path'"` //nolint: lll
++	VanillaBandwidth bool   `kong:"hidden,name=vanilla-bandwidth"`
+ }
+ 
+ func (r *Run) Run(cli *CLI, version string) error {
+@@ -16,5 +20,18 @@ func (r *Run) Run(cli *CLI, version string) error {
+ 		return fmt.Errorf("cannot init config: %w", err)
+ 	}
+ 
+-	return runProxy(conf, version, r.ConfigPath)
++	var bandwidth *mtglib.BandwidthOptions
++	var ready *launch.Ready
++	if r.VanillaBandwidth {
++		options, client, childReady, err := readBandwidthOptions(os.Stdin)
++		if err != nil {
++			return err
++		}
++		defer client.Close()
++
++		bandwidth = options
++		ready = childReady
++	}
++
++	return runProxy(conf, version, r.ConfigPath, bandwidth, ready)
+ }
+diff --git a/internal/cli/run_proxy.go b/internal/cli/run_proxy.go
+index dc4b6c1492de4d81a7bcef59881347bb82a8d36d..73ce6fa2d746c6b09836767e934c89ed3a576366 100644
+--- a/internal/cli/run_proxy.go
++++ b/internal/cli/run_proxy.go
+@@ -2,6 +2,7 @@ package cli
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"os"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/mhsanaei/mtg-multi/internal/config"
+ 	"github.com/mhsanaei/mtg-multi/internal/proxyprotocol"
+ 	"github.com/mhsanaei/mtg-multi/internal/utils"
++	launch "github.com/mhsanaei/mtg-multi/internal/vanillalaunch"
+ 	"github.com/mhsanaei/mtg-multi/ipblocklist"
+ 	"github.com/mhsanaei/mtg-multi/ipblocklist/files"
+ 	"github.com/mhsanaei/mtg-multi/logger"
+@@ -296,7 +298,7 @@ func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error)
+ 	}
+ }
+ 
+-func runProxy(conf *config.Config, version, configPath string) error { //nolint: funlen, cyclop
++func runProxy(conf *config.Config, version, configPath string, bandwidth *mtglib.BandwidthOptions, ready *launch.Ready) error { //nolint: funlen, cyclop
+ 	logger := makeLogger(conf)
+ 
+ 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
+@@ -352,6 +354,7 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
+ 		IPBlocklist:     blocklist,
+ 		IPAllowlist:     allowlist,
+ 		EventStream:     eventStream,
++		Bandwidth:       bandwidth,
+ 
+ 		Secrets:                     conf.GetSecrets(),
+ 		Concurrency:                 conf.GetConcurrency(mtglib.DefaultConcurrency),
+@@ -431,6 +434,16 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
+ 	ctx, cancel := context.WithCancel(utils.RootContext())
+ 	defer cancel()
+ 
++	// The management API can already be running. Acknowledge readiness once
++	// all public proxy listeners have bound successfully.
++	if ready != nil {
++		if err := ready.Notify(ctx); err != nil {
++			_ = listener.Close()
++			proxy.Shutdown()
++			return errors.New("cannot report VanillaProxy MTProto readiness")
++		}
++	}
++
+ 	// If the accept loop stops for any reason other than shutdown, the process
+ 	// must not stay alive without accepting connections: stop and report the
+ 	// error, so a supervisor (systemd, docker) restarts it.
+diff --git a/internal/cli/simple_run.go b/internal/cli/simple_run.go
+index a99919a9dbe0364d57431d88a0e184a58dfd1472..d1c39cf535c5f7b6daebdd25b4eb32c84876efc3 100644
+--- a/internal/cli/simple_run.go
++++ b/internal/cli/simple_run.go
+@@ -109,5 +109,5 @@ func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funle
+ 		return fmt.Errorf("invalid result configuration: %w", err)
+ 	}
+ 
+-	return runProxy(conf, version, "")
++	return runProxy(conf, version, "", nil, nil)
+ }
+diff --git a/internal/cli/vanilla_bandwidth.go b/internal/cli/vanilla_bandwidth.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf596dd57bdbb142e2ae9eece6285a527b5dee93
+--- /dev/null
++++ b/internal/cli/vanilla_bandwidth.go
+@@ -0,0 +1,51 @@
++package cli
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"io"
++
++	bandwidthipc "github.com/mhsanaei/mtg-multi/internal/vanillabandwidthipc"
++	launch "github.com/mhsanaei/mtg-multi/internal/vanillalaunch"
++	"github.com/mhsanaei/mtg-multi/mtglib"
++)
++
++const maxBandwidthBootstrapSize = 1 << 20
++
++func readBandwidthOptions(input io.Reader) (*mtglib.BandwidthOptions, *bandwidthipc.Client, *launch.Ready, error) {
++	var startup struct {
++		IPC            bandwidthipc.Info `json:"ipc"`
++		Clients        map[string]string `json:"clients"`
++		PolicyBindings map[string]string `json:"policy_bindings"`
++		Ready          launch.Ready      `json:"ready"`
++	}
++
++	data, err := io.ReadAll(io.LimitReader(input, maxBandwidthBootstrapSize+1))
++	if err != nil || len(data) > maxBandwidthBootstrapSize {
++		return nil, nil, nil, errors.New("cannot read VanillaProxy bandwidth bootstrap")
++	}
++
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&startup); err != nil || decoder.Decode(new(json.RawMessage)) != io.EOF {
++		return nil, nil, nil, errors.New("invalid VanillaProxy bandwidth bootstrap")
++	}
++
++	if !startup.Ready.Valid() {
++		return nil, nil, nil, errors.New("invalid VanillaProxy MTProto readiness challenge")
++	}
++
++	client, err := bandwidthipc.Dial(startup.IPC)
++	if err != nil {
++		return nil, nil, nil, err
++	}
++
++	options, err := mtglib.NewBandwidthOptions(client.Acquire, startup.Clients, startup.PolicyBindings)
++	if err != nil {
++		client.Close()
++		return nil, nil, nil, err
++	}
++
++	return options, client, &startup.Ready, nil
++}
+diff --git a/internal/cli/vanilla_bandwidth_test.go b/internal/cli/vanilla_bandwidth_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..18a824dbf5e2dc9138838fa097a2512de1ffc380
+--- /dev/null
++++ b/internal/cli/vanilla_bandwidth_test.go
+@@ -0,0 +1,51 @@
++package cli
++
++import (
++	"context"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	bandwidthipc "github.com/mhsanaei/mtg-multi/internal/vanillabandwidthipc"
++	launch "github.com/mhsanaei/mtg-multi/internal/vanillalaunch"
++)
++
++func TestVanillaBandwidthBootstrap(t *testing.T) {
++	server, err := bandwidthipc.Listen(func(context.Context, string, int) error { return nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++
++	data, err := json.Marshal(map[string]any{
++		"ipc":     server.Info(),
++		"clients": map[string]string{"named-secret": "canonical-id"},
++		"ready":   launch.Ready{Address: "127.0.0.1:12345", Nonce: make([]byte, launch.ReadyNonceSize)},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	options, client, ready, err := readBandwidthOptions(strings.NewReader(string(data)))
++	if err != nil || options == nil || client == nil || ready == nil || !ready.Valid() {
++		t.Fatalf("valid bootstrap returned options=%t client=%t err=%v", options != nil, client != nil, err)
++	}
++	client.Close()
++
++	for name, input := range map[string]string{
++		"absent":             "",
++		"missing capability": "{\"clients\":{}}",
++		"non-JSON trailer":   string(data) + "invalid",
++		"second object":      string(data) + "{}",
++		"oversized":          string(data) + strings.Repeat(" ", maxBandwidthBootstrapSize),
++		"invalid readiness":  strings.Replace(string(data), "127.0.0.1:12345", "192.0.2.1:12345", 1),
++		"invalid binding":    strings.Replace(string(data), "canonical-id", " canonical-id", 1),
++	} {
++		t.Run(name, func(t *testing.T) {
++			options, client, ready, err := readBandwidthOptions(strings.NewReader(input))
++			if err == nil || options != nil || client != nil || ready != nil {
++				t.Fatal("invalid bootstrap was accepted")
++			}
++		})
++	}
++}
+diff --git a/mtglib/proxy.go b/mtglib/proxy.go
+index 12daeacab43a498d4ea323d6c24c4d41667d9ed6..f887a755ae94c28e647afcb84d888b4c568de1d1 100644
+--- a/mtglib/proxy.go
++++ b/mtglib/proxy.go
+@@ -173,6 +173,7 @@ type Proxy struct {
+ 	ourIPv6        net.IP
+ 	advertisedPort int
+ 
++	bandwidth      *BandwidthOptions
+ 	usageStateFile string
+ 	emitTraffic    bool
+ 
+@@ -293,6 +294,16 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
+ 		return
+ 	}
+ 
++	clientID := ""
++	if p.bandwidth != nil {
++		var allowed bool
++		clientID, allowed = p.bandwidth.account(ctx.secretName, ctx.matchedSecretKey)
++		if !allowed {
++			ctx.logger.Info("authenticated secret has no bandwidth binding")
++			return
++		}
++	}
++
+ 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
+ 		ctx.logger.WarningError("cannot set deadline", err)
+ 		return
+@@ -305,12 +316,17 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
+ 
+ 	tracker := newIdleTracker(p.idleTimeout)
+ 
+-	relay.Relay(
+-		ctx,
+-		ctx.logger.Named("relay"),
+-		connIdleTimeout{Conn: ctx.telegramConn, tracker: tracker},
+-		newCountingConn(connIdleTimeout{Conn: ctx.clientConn, tracker: tracker}, p.stats, ctx.secretName),
++	var upstream essentials.Conn = connIdleTimeout{Conn: ctx.telegramConn, tracker: tracker}
++	var downstream essentials.Conn = newCountingConn(
++		connIdleTimeout{Conn: ctx.clientConn, tracker: tracker}, p.stats, ctx.secretName,
+ 	)
++
++	if p.bandwidth != nil {
++		upstream = p.bandwidth.wrap(ctx, upstream, clientID)
++		downstream = p.bandwidth.wrap(ctx, downstream, clientID)
++	}
++
++	relay.Relay(ctx, ctx.logger.Named("relay"), upstream, downstream)
+ }
+ 
+ // Serve starts a proxy on a given listener.
+@@ -388,7 +404,12 @@ func (p *Proxy) Shutdown() {
+ // /stats counters carry across the swap. It returns ErrReloaderNotConfigured
+ // when the proxy was built without a SecretsReloader, and an error (leaving the
+ // current set active) when the reloader fails or yields no valid secret.
++// VanillaProxy publishes secret changes through managed process restarts.
+ func (p *Proxy) ReloadSecrets() error {
++	if p.bandwidth != nil {
++		return errBandwidthManagedSecrets
++	}
++
+ 	if p.reloader == nil {
+ 		return ErrReloaderNotConfigured
+ 	}
+@@ -409,6 +430,12 @@ func (p *Proxy) ReloadSecrets() error {
+ // connections. It is the single mutation point shared by ReloadSecrets and the
+ // management-API mutators; the caller MUST hold reloadMu.
+ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
++	// The managed bindings live for the life of this process. Starting a new
++	// process publishes new keys and bindings together and closes old handshakes.
++	if p.bandwidth != nil {
++		return errBandwidthManagedSecrets
++	}
++
+ 	if len(cfg.Secrets) == 0 {
+ 		return ErrSecretInvalid
+ 	}
+@@ -914,6 +941,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
+ 		ourIPv4:                     opts.PublicIPv4,
+ 		ourIPv6:                     opts.PublicIPv6,
+ 		advertisedPort:              opts.AdvertisedPort,
++		bandwidth:                   opts.Bandwidth,
+ 		usageStateFile:              opts.UsageStateFile,
+ 		emitTraffic:                 opts.EmitTraffic,
+ 	}
+diff --git a/mtglib/proxy_api.go b/mtglib/proxy_api.go
+index 1ae7e82e662c67c8f98a91370e416ee52378c75f..94ab12375573c5006614a47b4f518deafd39e65d 100644
+--- a/mtglib/proxy_api.go
++++ b/mtglib/proxy_api.go
+@@ -226,15 +226,15 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
+ }
+ 
+ // buildAPIHandler wires every management route and wraps the mux in the bearer
+-// token middleware. When p has no file reloader, /reload keeps reporting the
+-// capability as unavailable (503).
++// token middleware. /reload reports unavailable (503) when there is no file
++// reloader or VanillaProxy manages the process.
+ func (p *Proxy) buildAPIHandler(token string) http.Handler {
+ 	mux := http.NewServeMux()
+ 
+ 	mux.HandleFunc("GET /stats", p.handleStats)
+ 
+ 	var reload func() error
+-	if p.reloader != nil {
++	if p.reloader != nil && p.bandwidth == nil {
+ 		reload = p.ReloadSecrets
+ 	}
+ 
+@@ -579,13 +579,13 @@ func (p *Proxy) handleDeleteAdTag(w http.ResponseWriter, _ *http.Request) {
+ var statusOK = map[string]string{"status": "ok"}
+ 
+ // secretMutationStatus maps a mutation error to an HTTP status: 404 for an
+-// unknown secret, 409 when a delete would empty the set, and 400 for every
+-// validation failure (invalid secret, invalid/oversized adtag, empty set).
++// unknown secret, 409 for a managed set or a delete that would empty the
++// set, and 400 for validation failures.
+ func secretMutationStatus(err error) int {
+ 	switch {
+ 	case errors.Is(err, ErrSecretNotFound):
+ 		return http.StatusNotFound
+-	case errors.Is(err, ErrLastSecret):
++	case errors.Is(err, ErrLastSecret), errors.Is(err, errBandwidthManagedSecrets):
+ 		return http.StatusConflict
+ 	default:
+ 		return http.StatusBadRequest
+diff --git a/mtglib/proxy_opts.go b/mtglib/proxy_opts.go
+index 6b85e6ae8e3aa5be2b34fca1c48f7bf24daee71a..c58c6824c57b064599d319147680ec0907f8e93e 100644
+--- a/mtglib/proxy_opts.go
++++ b/mtglib/proxy_opts.go
+@@ -34,6 +34,9 @@ type SecretConfig struct {
+ // This is not required per se, but this is to shorten function signature and
+ // give an ability to conveniently provide default values.
+ type ProxyOpts struct {
++	// Bandwidth optionally limits authenticated relay traffic through VanillaProxy.
++	Bandwidth *BandwidthOptions
++
+ 	// Secret defines a secret which should be used by a proxy.
+ 	//
+ 	// Deprecated: Use Secrets instead for multi-secret support.
+@@ -350,7 +353,7 @@ func (p ProxyOpts) valid() error {
+ 		}
+ 	}
+ 
+-	return nil
++	return p.Bandwidth.validateSecrets(secrets)
+ }
+ 
+ // getSecrets returns the effective secrets map. If Secrets is populated, it is
+diff --git a/mtglib/vanilla_bandwidth.go b/mtglib/vanilla_bandwidth.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ae9df0e9a833cc36ada317ee6a749aa33dc456c
+--- /dev/null
++++ b/mtglib/vanilla_bandwidth.go
+@@ -0,0 +1,113 @@
++package mtglib
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"maps"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/mhsanaei/mtg-multi/essentials"
++	bandwidthipc "github.com/mhsanaei/mtg-multi/internal/vanillabandwidthipc"
++)
++
++var errBandwidthManagedSecrets = errors.New("VanillaProxy manages this secret configuration through process restarts")
++
++// BandwidthOptions binds authenticated secret names and signing keys to the
++// panel's client IDs.
++type BandwidthOptions struct {
++	gate           bandwidthipc.Gate
++	clients        map[string]string
++	policyBindings map[string]string
++}
++
++func NewBandwidthOptions(gate bandwidthipc.Gate, clients, policyBindings map[string]string) (*BandwidthOptions, error) {
++	if gate == nil || len(clients) == 0 || (policyBindings != nil && len(policyBindings) != len(clients)) {
++		return nil, errors.New("VanillaProxy bandwidth gate and client bindings are required")
++	}
++
++	for name, id := range clients {
++		if name == "" || !utf8.ValidString(name) || strings.IndexFunc(name, unicode.IsControl) >= 0 ||
++			(id == "" && policyBindings == nil) || len(id) > 256 || !utf8.ValidString(id) ||
++			strings.TrimSpace(id) != id || strings.IndexFunc(id, unicode.IsControl) >= 0 {
++			return nil, errors.New("invalid VanillaProxy bandwidth client binding")
++		}
++		if policyBindings != nil {
++			pin := policyBindings[name]
++			if _, err := hex.DecodeString(pin); err != nil || len(pin) != sha256.Size*2 || strings.ToLower(pin) != pin {
++				return nil, errors.New("invalid VanillaProxy bandwidth credential fingerprint")
++			}
++		}
++	}
++
++	return &BandwidthOptions{gate: gate, clients: maps.Clone(clients), policyBindings: maps.Clone(policyBindings)}, nil
++}
++
++func bandwidthCredentialFingerprint(key []byte) string {
++	digest := sha256.Sum256([]byte("mtproto\x00" + hex.EncodeToString(key)))
++	return hex.EncodeToString(digest[:])
++}
++
++func (b *BandwidthOptions) account(name string, key []byte) (string, bool) {
++	id, found := b.clients[name]
++	if b.policyBindings != nil {
++		found = found && len(key) == SecretKeyLength && b.policyBindings[name] == bandwidthCredentialFingerprint(key)
++	}
++	return id, found
++}
++
++// FakeTLS chooses the client name by signing key. Distinct hostnames do not
++// distinguish entries that share that key.
++func (b *BandwidthOptions) validateSecrets(secrets map[string]Secret) error {
++	if b == nil {
++		return nil
++	}
++
++	if len(b.clients) != len(secrets) {
++		return fmt.Errorf("%w: VanillaProxy bandwidth bindings differ from configured secrets", ErrSecretInvalid)
++	}
++	keys := make(map[[SecretKeyLength]byte]struct{}, len(secrets))
++	for name, secret := range secrets {
++		if _, allowed := b.account(name, secret.Key[:]); !allowed {
++			return fmt.Errorf("%w: VanillaProxy bandwidth credential binding differs from configured secret", ErrSecretInvalid)
++		}
++		if _, exists := keys[secret.Key]; exists {
++			return fmt.Errorf("%w: VanillaProxy bandwidth requires unique FakeTLS signing keys", ErrSecretInvalid)
++		}
++		keys[secret.Key] = struct{}{}
++	}
++
++	return nil
++}
++
++func (b *BandwidthOptions) wrap(ctx *streamContext, conn essentials.Conn, clientID string) essentials.Conn {
++	if clientID == "" {
++		return conn
++	}
++	return bandwidthConn{Conn: conn, ctx: ctx, gate: b.gate, clientID: clientID}
++}
++
++type bandwidthConn struct {
++	essentials.Conn
++	ctx      *streamContext
++	gate     bandwidthipc.Gate
++	clientID string
++}
++
++func (c bandwidthConn) Read(p []byte) (int, error) {
++	return c.Conn.Read(p[:min(len(p), bandwidthipc.MaxPermitBytes)])
++}
++
++func (c bandwidthConn) Write(p []byte) (int, error) {
++	if len(p) > 0 {
++		if err := c.gate(c.ctx, c.clientID, len(p)); err != nil {
++			c.ctx.ctxCancel()
++			return 0, err
++		}
++	}
++
++	return c.Conn.Write(p)
++}
+diff --git a/mtglib/vanilla_bandwidth_test.go b/mtglib/vanilla_bandwidth_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d619b1010577bbe8c888a7c81aeaf46be1b3916
+--- /dev/null
++++ b/mtglib/vanilla_bandwidth_test.go
+@@ -0,0 +1,273 @@
++package mtglib
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/mhsanaei/mtg-multi/essentials"
++	bandwidthipc "github.com/mhsanaei/mtg-multi/internal/vanillabandwidthipc"
++	"github.com/mhsanaei/mtg-multi/mtglib/internal/relay"
++)
++
++func TestVanillaBandwidthRelay(t *testing.T) {
++	type request struct {
++		clientID string
++		size     int
++		result   chan error
++	}
++	requests := make(chan request)
++	server, err := bandwidthipc.Listen(func(ctx context.Context, clientID string, size int) error {
++		req := request{clientID: clientID, size: size, result: make(chan error, 1)}
++		select {
++		case requests <- req:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++		select {
++		case err := <-req.result:
++			return err
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++
++	gate, err := bandwidthipc.Dial(server.Info())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer gate.Close()
++
++	const secretName = "named-secret"
++	const clientID = "canonical-id"
++	options, err := NewBandwidthOptions(gate.Acquire, map[string]string{secretName: clientID}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	stream := &streamContext{ctx: ctx, ctxCancel: cancel, secretName: secretName}
++	telegram, upstream := net.Pipe()
++	defer telegram.Close()
++	client, downstream := net.Pipe()
++	defer client.Close()
++	deadline, _ := ctx.Deadline()
++	telegram.SetDeadline(deadline)
++	client.SetDeadline(deadline)
++
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		relay.Relay(stream, NoopLogger{},
++			options.wrap(stream, essentials.WrapNetConn(upstream), options.clients[stream.secretName]),
++			options.wrap(stream, essentials.WrapNetConn(downstream), options.clients[stream.secretName]),
++		)
++	}()
++
++	waitPermit := func(size int) request {
++		t.Helper()
++		select {
++		case req := <-requests:
++			if req.clientID != clientID || req.size != size {
++				t.Fatalf("permit for %q, %d bytes; want %q, %d bytes", req.clientID, req.size, clientID, size)
++			}
++			return req
++		case <-ctx.Done():
++			t.Fatal("relay did not request a permit")
++			return request{}
++		}
++	}
++
++	send := func(from, to net.Conn, data string, permitErr error) {
++		t.Helper()
++		writeErr := make(chan error, 1)
++		go func() {
++			_, err := io.WriteString(from, data)
++			writeErr <- err
++		}()
++		req := waitPermit(len(data))
++
++		// The payload has reached the relay, but the writer is still awaiting permission.
++		to.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
++		buf := make([]byte, len(data))
++		n, err := to.Read(buf)
++		var netErr net.Error
++		if n != 0 || !errors.As(err, &netErr) || !netErr.Timeout() {
++			t.Fatalf("pre-permit read returned %d bytes, %v", n, err)
++		}
++		to.SetReadDeadline(deadline)
++		req.result <- permitErr
++		n, err = io.ReadFull(to, buf)
++		if permitErr != nil {
++			if n != 0 || !errors.Is(err, io.EOF) {
++				t.Fatalf("denied payload read returned %d bytes, %v", n, err)
++			}
++		} else if err != nil || string(buf) != data {
++			t.Fatalf("got %q, %v; want %q", buf, err, data)
++		}
++		if err := <-writeErr; err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	send(client, telegram, "upload", nil)
++	send(telegram, client, "download", nil)
++	send(client, telegram, "denied", errors.New("test permit denied"))
++
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("relay did not shut down on permit denial")
++	}
++}
++
++func TestVanillaBandwidthRejectsRepeatedSigningKeys(t *testing.T) {
++	first := GenerateSecret("first.example.com")
++	second := first
++	second.Host = "second.example.com"
++	duplicates := map[string]Secret{"first": first, "second": second}
++	distinct := map[string]Secret{"first": first, "second": GenerateSecret(first.Host)}
++	bandwidth, err := NewBandwidthOptions(func(context.Context, string, int) error { return nil },
++		map[string]string{"first": "id-1", "second": "id-2"}, nil,
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	opts := ProxyOpts{
++		Secrets:         duplicates,
++		Network:         struct{ Network }{},
++		AntiReplayCache: struct{ AntiReplayCache }{},
++		IPBlocklist:     struct{ IPBlocklist }{},
++		IPAllowlist:     struct{ IPBlocklist }{},
++		EventStream:     &EventStreamMock{},
++		Logger:          NoopLogger{},
++	}
++	if err := opts.valid(); err != nil {
++		t.Fatalf("ordinary mode rejected valid secrets: %v", err)
++	}
++	opts.Bandwidth = bandwidth
++	if _, err := NewProxy(opts); !errors.Is(err, ErrSecretInvalid) {
++		t.Fatalf("managed startup returned %v; want ErrSecretInvalid", err)
++	}
++	opts.Secrets = distinct
++	if err := opts.valid(); err != nil {
++		t.Fatalf("managed mode rejected distinct keys for the same host: %v", err)
++	}
++}
++
++func TestVanillaBandwidthAllowsOnlyExactPublishedCredential(t *testing.T) {
++	secret := Secret{Key: [SecretKeyLength]byte{15}, Host: "example.org"}
++	pin := bandwidthCredentialFingerprint(secret.Key[:])
++	gate := func(context.Context, string, int) error {
++		t.Fatal("an explicitly unmetered secret called the gate")
++		return nil
++	}
++	clients := map[string]string{"exempt": ""}
++	if _, err := NewBandwidthOptions(gate, clients, nil); err == nil {
++		t.Fatal("legacy bootstrap accepted an empty client ID")
++	}
++	options, err := NewBandwidthOptions(gate, clients, map[string]string{"exempt": pin})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := options.validateSecrets(map[string]Secret{"exempt": secret}); err != nil {
++		t.Fatal(err)
++	}
++	id, allowed := options.account("exempt", secret.Key[:])
++	if !allowed || id != "" {
++		t.Fatalf("account = %q, %t; want explicit unmetered", id, allowed)
++	}
++	var conn essentials.Conn
++	if wrapped := options.wrap(nil, conn, id); wrapped != conn {
++		t.Fatal("unmetered connection was wrapped")
++	}
++	if _, allowed := options.account("other", secret.Key[:]); allowed {
++		t.Fatal("matching key authorized a different name")
++	}
++	secret.Key[0]++
++	if _, allowed := options.account("exempt", secret.Key[:]); allowed {
++		t.Fatal("matching name authorized a different key")
++	}
++	if err := options.validateSecrets(map[string]Secret{"exempt": secret}); !errors.Is(err, ErrSecretInvalid) {
++		t.Fatalf("stale bootstrap returned %v; want ErrSecretInvalid", err)
++	}
++}
++
++func TestVanillaBandwidthManagementFreezesSecretSet(t *testing.T) {
++	first := GenerateSecret("first.example.com")
++	second := GenerateSecret("second.example.com")
++	initial := map[string]Secret{"first": first, "second": second}
++	p := newReloadTestProxy(initial)
++	p.logger = NoopLogger{}
++	p.bandwidth = &BandwidthOptions{}
++	reloaderCalled := false
++	p.reloader = func() (SecretConfig, error) {
++		reloaderCalled = true
++		return SecretConfig{Secrets: initial}, nil
++	}
++	before := p.secrets.Load()
++	if err := p.ReloadSecrets(); !errors.Is(err, errBandwidthManagedSecrets) {
++		t.Fatalf("direct reload returned %v; want managed secret error", err)
++	}
++
++	requests := []struct {
++		method string
++		path   string
++		body   string
++		status int
++	}{
++		{http.MethodGet, "/stats", "", http.StatusOK},
++		{http.MethodGet, "/secrets", "", http.StatusOK},
++		{http.MethodGet, "/adtag", "", http.StatusOK},
++		{http.MethodPost, "/secrets/first/reset-quota", "", http.StatusOK},
++		{http.MethodPost, "/reload", "", http.StatusServiceUnavailable},
++		{http.MethodDelete, "/secrets/first", "", http.StatusConflict},
++		{http.MethodPost, "/secrets", fmt.Sprintf(`{"name":"added","secret":%q}`, second.Hex()), http.StatusConflict},
++		{http.MethodPut, "/secrets", fmt.Sprintf(`{"secrets":{"added":{"secret":%q}}}`, second.Hex()), http.StatusConflict},
++		{http.MethodPut, "/adtag", fmt.Sprintf(`{"ad_tag":%q}`, strings.Repeat("ab", AdTagLength)), http.StatusConflict},
++		{http.MethodDelete, "/adtag", "", http.StatusConflict},
++	}
++	request := func(handler http.Handler, method, path, body string) int {
++		t.Helper()
++		recorder := httptest.NewRecorder()
++		req := httptest.NewRequest(method, path, strings.NewReader(body))
++		handler.ServeHTTP(recorder, req)
++		return recorder.Code
++	}
++
++	handler := p.buildAPIHandler("")
++	for _, test := range requests {
++		status := request(handler, test.method, test.path, test.body)
++		if status != test.status {
++			t.Errorf("%s %s returned %d; want %d", test.method, test.path, status, test.status)
++		}
++	}
++	if reloaderCalled || p.secrets.Load() != before {
++		t.Fatal("managed API changed secret state or invoked the file reloader")
++	}
++
++	p.bandwidth = nil
++	handler = p.buildAPIHandler("")
++	for _, test := range requests {
++		status := request(handler, test.method, test.path, test.body)
++		if status != http.StatusOK {
++			t.Errorf("ordinary %s %s returned %d; want %d", test.method, test.path, status, http.StatusOK)
++		}
++	}
++	if !reloaderCalled || p.secrets.Load() == before {
++		t.Fatal("ordinary API failed to change secret state and invoke the file reloader")
++	}
++}

@@ -3391,6 +3391,9 @@
             "description": "AwgServer carries the full AmneziaWG server block (keys, subnet,\nobfuscation params) so the clients page can render a downloadable\nper-client .conf without a second round trip.",
             "nullable": true
           },
+          "bandwidthNodeKey": {
+            "type": "string"
+          },
           "enable": {
             "example": true,
             "type": "boolean"
@@ -3468,6 +3471,7 @@
           }
         },
         "required": [
+          "bandwidthNodeKey",
           "enable",
           "id",
           "port",
@@ -5487,6 +5491,7 @@
                   "obj": [
                     {
                       "awgServer": null,
+                      "bandwidthNodeKey": "",
                       "enable": true,
                       "id": 1,
                       "listen": "",
@@ -8715,6 +8720,201 @@
                       "type": "string"
                     },
                     "obj": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/panel/api/clients/{email}/bandwidth": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Read the bandwidth policy for a client.",
+        "operationId": "get_panel_api_clients_email_bandwidth",
+        "description": "Rates are nonnegative integer bits per second. A total of zero inherits the startup quota. An omitted node inherits its default, while an explicit node rate of zero removes its extra cap. Saved overrides for detached nodes are also returned so they can be restored on reattachment.",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "path",
+            "required": true,
+            "description": "Client email (URL-encoded).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "type": "object",
+                      "properties": {
+                        "totalBitsPerSecond": {
+                          "type": "integer",
+                          "format": "int64",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "nodeBitsPerSecond": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "integer",
+                            "format": "int64",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          }
+                        },
+                        "available": {
+                          "type": "boolean"
+                        },
+                        "accountNodeKeys": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "totalBitsPerSecond",
+                        "nodeBitsPerSecond",
+                        "available"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "obj": {
+                    "available": true,
+                    "totalBitsPerSecond": 20000000,
+                    "nodeBitsPerSecond": {
+                      "local": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Set the bandwidth policy for a client and its associated nodes.",
+        "operationId": "post_panel_api_clients_email_bandwidth",
+        "description": "Use bandwidthNodeKey values for currently attached nodes. Saved overrides for detached nodes are retained and returned. For a positive total cap, each submitted node cap must be less than or equal to that total. The policy can be saved even when the response reports that the client is outside the running bandwidth limiter.",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "path",
+            "required": true,
+            "description": "Client email (URL-encoded).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "totalBitsPerSecond": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "nodeBitsPerSecond": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                },
+                "required": [
+                  "totalBitsPerSecond",
+                  "nodeBitsPerSecond"
+                ]
+              },
+              "example": {
+                "totalBitsPerSecond": 20000000,
+                "nodeBitsPerSecond": {
+                  "local": 0
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "type": "object",
+                      "properties": {
+                        "totalBitsPerSecond": {
+                          "type": "integer",
+                          "format": "int64",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "nodeBitsPerSecond": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "integer",
+                            "format": "int64",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          }
+                        },
+                        "available": {
+                          "type": "boolean"
+                        },
+                        "accountNodeKeys": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "totalBitsPerSecond",
+                        "nodeBitsPerSecond",
+                        "available"
+                      ]
+                    }
                   }
                 }
               }

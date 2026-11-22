@@ -1,7 +1,9 @@
 package tuic
 
 import (
+	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ type managed struct {
 	tag          string
 	structuralFP string
 	usersFP      string
+	bandwidth    bandwidthClients
 }
 
 type Manager struct {
@@ -20,6 +23,9 @@ type Manager struct {
 	servers        map[int]*managed
 	lastStartErr   map[int]string
 	pendingTraffic map[string]ClientTrafficDelta
+	bandwidthWait  func(context.Context, string, int) error
+	resolveAccount func(string) (string, bool)
+	started        bool
 }
 
 var (
@@ -56,19 +62,40 @@ func (m *Manager) Ensure(inst Instance) error {
 }
 
 func (m *Manager) ensureLocked(inst Instance) error {
-	if err := ValidateClients(inst.Clients); err != nil {
-		return err
+	var bindings bandwidthClients
+	if m.bandwidthWait == nil {
+		if err := ValidateClients(inst.Clients); err != nil {
+			return err
+		}
+	} else {
+		if m.resolveAccount == nil {
+			return fmt.Errorf("tuic: reconcile automatic bandwidth with exact bindings")
+		}
+		var err error
+		bindings, err = prepareBandwidthClients(inst.Clients, m.resolveAccount, false)
+		if err != nil {
+			m.removeLocked(inst.Id)
+			m.reportStartErrorLocked(inst, err)
+			return err
+		}
 	}
+	return m.ensureWithBandwidthLocked(inst, bindings)
+}
+
+func (m *Manager) ensureWithBandwidthLocked(inst Instance, bindings bandwidthClients) error {
 	if len(inst.Clients) == 0 {
 		m.removeLocked(inst.Id)
 		return nil
 	}
 
 	structuralFP := inst.StructuralFingerprint()
-	usersFP := inst.UsersFingerprint()
+	var usersFP string
+	if m.bandwidthWait == nil {
+		usersFP = inst.UsersFingerprint()
+	}
 
 	if existing, ok := m.servers[inst.Id]; ok && existing != nil {
-		if existing.server != nil && existing.server.IsRunning() && existing.structuralFP == structuralFP {
+		if existing.server != nil && existing.server.IsRunning() && existing.structuralFP == structuralFP && maps.Equal(existing.bandwidth, bindings) {
 			existing.tag = inst.Tag
 			existing.server.UpdateRuntimeSettings(inst.Tag, inst.CongestionControl, inst.LogLevel)
 			if existing.usersFP != usersFP {
@@ -81,16 +108,12 @@ func (m *Manager) ensureLocked(inst Instance) error {
 		delete(m.servers, inst.Id)
 	}
 
-	server, err := m.startLocked(inst)
+	server, err := m.startLocked(inst, bindings)
 	if err != nil {
-		if m.lastStartErr[inst.Id] != err.Error() {
-			m.lastStartErr[inst.Id] = err.Error()
-			if tuicLogWarn >= parseLogLevel(inst.LogLevel) {
-				logger.Warningf("tuic: inbound %d (%s): failed to start server: %v", inst.Id, inst.Tag, err)
-			}
-		}
+		m.reportStartErrorLocked(inst, err)
 		return err
 	}
+	m.started = true
 	delete(m.lastStartErr, inst.Id)
 
 	m.servers[inst.Id] = &managed{
@@ -98,18 +121,38 @@ func (m *Manager) ensureLocked(inst Instance) error {
 		tag:          inst.Tag,
 		structuralFP: structuralFP,
 		usersFP:      usersFP,
+		bandwidth:    bindings,
 	}
 	return nil
 }
 
-func (m *Manager) startLocked(inst Instance) (*Server, error) {
+func (m *Manager) reportStartErrorLocked(inst Instance, err error) {
+	if m.lastStartErr[inst.Id] == err.Error() {
+		return
+	}
+	m.lastStartErr[inst.Id] = err.Error()
+	if tuicLogWarn >= parseLogLevel(inst.LogLevel) {
+		logger.Warningf("tuic: inbound %d (%s): failed to start server: %v", inst.Id, inst.Tag, err)
+	}
+}
+
+func (m *Manager) startLocked(inst Instance, bindings bandwidthClients) (*Server, error) {
+	port := SOCKSPortForInbound(inst.Id)
 	relay := &SocksRelay{
-		Gate:      ManagedRelayGate(SOCKSPortForInbound(inst.Id)),
+		Gate:      ManagedRelayGate(port),
 		InboundID: inst.Id,
-		Addr:      fmt.Sprintf("127.0.0.1:%d", SOCKSPortForInbound(inst.Id)),
+		Addr:      fmt.Sprintf("127.0.0.1:%d", port),
 		Password:  SocksPassword(),
 	}
-	server, err := NewServer(inst, relay)
+	var resolve func([16]byte, string) (string, bool)
+	if m.bandwidthWait != nil {
+		if err := requireManagedRelayPassword(relay.Password); err != nil {
+			return nil, err
+		}
+		relay.RequireBoundUDP = true
+		resolve = bindings.resolve
+	}
+	server, err := NewServerWithBandwidth(inst, relay, m.bandwidthWait, resolve)
 	if err != nil {
 		return nil, fmt.Errorf("tuic: init server for %d: %w", inst.Id, err)
 	}

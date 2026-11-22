@@ -865,6 +865,7 @@ export const EXAMPLES: Record<string, unknown> = {
   },
   "InboundOption": {
     "awgServer": null,
+    "bandwidthNodeKey": "",
     "enable": true,
     "id": 1,
     "listen": "",

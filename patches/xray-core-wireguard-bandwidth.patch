@@ -1,0 +1,687 @@
+diff --git b/proxy/wireguard/packet_gate.go b/proxy/wireguard/packet_gate.go
+new file mode 100644
+index 0000000..55bee58
+--- /dev/null
++++ b/proxy/wireguard/packet_gate.go
+@@ -0,0 +1,301 @@
++package wireguard
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"net/netip"
++	"os"
++	"slices"
++	"sort"
++	"strconv"
++	"sync"
++
++	"github.com/xtls/xray-core/common/protocol"
++	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++type wireGuardPacketGate interface {
++	VanillaProxyWireGuardClients(context.Context, []*protocol.MemoryUser) (map[[32]byte]string, bool, error)
++	VanillaProxyWaitWireGuardPacket(context.Context, string, int) error
++	VanillaProxyMarkWireGuardFlow(context.Context) (context.Context, error)
++}
++
++func (*Server) VanillaProxyWireGuardPacketGateV1() {}
++
++func (s *Server) VanillaProxyWireGuardPacketGateEnabled() bool { return s.packetPolicy != nil }
++
++const (
++	packetsPerAccountDirection = 32
++	packetsPerTunnelDirection  = 1024
++)
++
++type packetGateLane struct {
++	queue chan []byte
++	slots chan struct{}
++}
++
++type packetGateClient struct {
++	id   string
++	lane [2]packetGateLane
++}
++
++type packetGateRoute struct {
++	prefix netip.Prefix
++	user   *protocol.MemoryUser
++	client *packetGateClient
++}
++
++type packetGatePolicy struct {
++	gate    wireGuardPacketGate
++	routes  []packetGateRoute
++	clients map[string]*packetGateClient
++}
++
++func newPacketGatePolicy(gate wireGuardPacketGate, serverKey [32]byte, users []*protocol.MemoryUser, clientIDs map[[32]byte]string) (*packetGatePolicy, error) {
++	policy := &packetGatePolicy{gate: gate, clients: make(map[string]*packetGateClient)}
++	keys := make(map[[32]byte]struct{}, len(users))
++	for _, user := range users {
++		peer := user.Account.(*MemoryAccount)
++		id := clientIDs[peer.Pub]
++		_, duplicate := keys[peer.Pub]
++		if id == "" || duplicate || peer.Pub == serverKey || peer.Pub == ([32]byte{}) || len(peer.AllowedIPs) == 0 {
++			return nil, fmt.Errorf("managed WireGuard peer %q requires a bound unique public key and AllowedIPs", user.Email)
++		}
++		keys[peer.Pub] = struct{}{}
++		// These fields are inserted into the WireGuard UAPI as single lines.
++		if peer.PreSharedKey != "" {
++			if _, err := ParseKey(peer.PreSharedKey); err != nil {
++				return nil, fmt.Errorf("invalid preshared key for managed WireGuard peer %q", user.Email)
++			}
++		}
++		if peer.KeepAlive != "" {
++			if _, err := strconv.ParseUint(peer.KeepAlive, 10, 16); err != nil {
++				return nil, fmt.Errorf("invalid keepalive for managed WireGuard peer %q", user.Email)
++			}
++		}
++		client := policy.clients[id]
++		if client == nil {
++			client = &packetGateClient{id: id}
++			policy.clients[id] = client
++		}
++		for _, prefix := range peer.AllowedIPs {
++			if !prefix.IsValid() || prefix.Addr().Is4In6() {
++				return nil, fmt.Errorf("invalid AllowedIP for managed WireGuard peer %q", user.Email)
++			}
++			policy.routes = append(policy.routes, packetGateRoute{prefix.Masked(), user, client})
++		}
++	}
++	if len(keys) != len(clientIDs) {
++		return nil, fmt.Errorf("managed WireGuard binding references an unconfigured peer")
++	}
++	slices.SortFunc(policy.routes, func(a, b packetGateRoute) int { return a.prefix.Addr().Compare(b.prefix.Addr()) })
++	for i := 1; i < len(policy.routes); i++ {
++		prev, next := policy.routes[i-1].prefix, policy.routes[i].prefix
++		if prev.Overlaps(next) {
++			return nil, fmt.Errorf("overlapping managed WireGuard AllowedIPs %s and %s", prev, next)
++		}
++	}
++	return policy, nil
++}
++
++func (p *packetGatePolicy) route(addr netip.Addr) *packetGateRoute {
++	i := sort.Search(len(p.routes), func(i int) bool { return p.routes[i].prefix.Addr().Compare(addr) > 0 })
++	if i != 0 && p.routes[i-1].prefix.Contains(addr) {
++		return &p.routes[i-1]
++	}
++	return nil
++}
++
++type packetGateDirection int
++
++const (
++	packetUpload packetGateDirection = iota
++	packetDownload
++)
++
++type admittedWireGuardPacket struct {
++	data []byte
++	lane *packetGateLane
++}
++
++// packetGateTun sits between WireGuard and Xray's stack. Only decrypted
++// packets that passed WireGuard's peer AllowedIPs check reach Write, and
++// downlink packets leave Read before WireGuard encrypts for the chosen peer.
++type packetGateTun struct {
++	tun.Device
++	policy *packetGatePolicy
++	ctx    context.Context
++	cancel context.CancelFunc
++	slots  [2]chan struct{}
++	ready  chan admittedWireGuardPacket
++
++	workers   sync.WaitGroup
++	enqueueMu sync.RWMutex
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func newPacketGateTun(base tun.Device, policy *packetGatePolicy) *packetGateTun {
++	ctx, cancel := context.WithCancel(context.Background())
++	t := &packetGateTun{Device: base, policy: policy, ctx: ctx, cancel: cancel, ready: make(chan admittedWireGuardPacket, packetsPerTunnelDirection)}
++	for direction := packetUpload; direction <= packetDownload; direction++ {
++		t.slots[direction] = make(chan struct{}, packetsPerTunnelDirection)
++		for _, client := range policy.clients {
++			lane := &client.lane[direction]
++			lane.queue = make(chan []byte, packetsPerAccountDirection)
++			lane.slots = make(chan struct{}, packetsPerAccountDirection)
++			t.workers.Go(func() { t.runLane(client.id, lane, direction) })
++		}
++	}
++	t.workers.Go(t.readDownlink)
++	return t
++}
++
++func wireGuardPacketAddress(packet []byte, direction packetGateDirection) netip.Addr {
++	if len(packet) == 0 || len(packet) > device.MaxContentSize {
++		return netip.Addr{}
++	}
++	switch packet[0] >> 4 {
++	case 4:
++		if len(packet) >= 20 {
++			start := 12 + 4*int(direction)
++			return netip.AddrFrom4([4]byte(packet[start : start+4]))
++		}
++	case 6:
++		if len(packet) >= 40 {
++			start := 8 + 16*int(direction)
++			addr := netip.AddrFrom16([16]byte(packet[start : start+16]))
++			if !addr.Is4In6() {
++				return addr
++			}
++		}
++	}
++	return netip.Addr{}
++}
++
++func (t *packetGateTun) enqueue(packet []byte, direction packetGateDirection) {
++	route := t.policy.route(wireGuardPacketAddress(packet, direction))
++	if route == nil {
++		return
++	}
++	t.enqueueMu.RLock()
++	defer t.enqueueMu.RUnlock()
++	if t.ctx.Err() != nil {
++		return
++	}
++	lane := &route.client.lane[direction]
++	select {
++	case lane.slots <- struct{}{}:
++	default:
++		return
++	}
++	select {
++	case t.slots[direction] <- struct{}{}:
++	default:
++		<-lane.slots
++		return
++	}
++	// WireGuard and the stack both reuse their input buffers. Each queued
++	// packet owns a slot until it is dropped or consumed by its destination.
++	lane.queue <- bytes.Clone(packet)
++}
++
++func (t *packetGateTun) release(lane *packetGateLane, direction packetGateDirection) {
++	<-t.slots[direction]
++	<-lane.slots
++}
++
++func (t *packetGateTun) runLane(clientID string, lane *packetGateLane, direction packetGateDirection) {
++	for t.ctx.Err() == nil {
++		select {
++		case <-t.ctx.Done():
++			return
++		case packet := <-lane.queue:
++			if t.ctx.Err() == nil && t.policy.gate.VanillaProxyWaitWireGuardPacket(t.ctx, clientID, len(packet)) == nil && t.ctx.Err() == nil {
++				if direction == packetDownload {
++					t.ready <- admittedWireGuardPacket{packet, lane}
++					continue
++				}
++				_, _ = t.Device.Write([][]byte{packet}, 0)
++			}
++			t.release(lane, direction)
++		}
++	}
++}
++
++func (t *packetGateTun) readDownlink() {
++	defer t.cancel()
++	// The native server TUN has BatchSize 1. Its stack writes plain IP.
++	buffer := make([]byte, device.MaxContentSize+1)
++	bufs := [][]byte{buffer}
++	sizes := []int{0}
++	for t.ctx.Err() == nil {
++		n, err := t.Device.Read(bufs, sizes, 0)
++		if err != nil {
++			return
++		}
++		if n != 0 {
++			t.enqueue(buffer[:sizes[0]], packetDownload)
++		}
++	}
++}
++
++func (t *packetGateTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	for t.ctx.Err() == nil {
++		select {
++		case <-t.ctx.Done():
++			return 0, os.ErrClosed
++		case packet := <-t.ready:
++			t.release(packet.lane, packetDownload)
++			if t.ctx.Err() == nil && len(packet.data) <= len(bufs[0])-offset {
++				sizes[0] = copy(bufs[0][offset:], packet.data)
++				return 1, nil
++			}
++		}
++	}
++	return 0, os.ErrClosed
++}
++
++func (t *packetGateTun) Write(bufs [][]byte, offset int) (int, error) {
++	if t.ctx.Err() != nil {
++		return 0, os.ErrClosed
++	}
++	for _, buffer := range bufs {
++		t.enqueue(buffer[offset:], packetUpload)
++	}
++	// Dropping a packet whose queue is full keeps other peers' cryptographic
++	// receivers and the shared TUN moving. IP transports handle packet loss.
++	return len(bufs), nil
++}
++
++func (t *packetGateTun) Close() error {
++	t.closeOnce.Do(func() {
++		t.cancel()
++		t.closeErr = t.Device.Close()
++		t.workers.Wait()
++		// No workers can publish data now. Exclude final concurrent enqueues
++		// so a closed server does not retain any queued packet buffers.
++		t.enqueueMu.Lock()
++		defer t.enqueueMu.Unlock()
++		for _, client := range t.policy.clients {
++			for direction := packetUpload; direction <= packetDownload; direction++ {
++				lane := &client.lane[direction]
++				for len(lane.queue) != 0 {
++					<-lane.queue
++					t.release(lane, direction)
++				}
++			}
++		}
++		for {
++			select {
++			case packet := <-t.ready:
++				t.release(packet.lane, packetDownload)
++			default:
++				return
++			}
++		}
++	})
++	return t.closeErr
++}
+diff --git b/proxy/wireguard/packet_gate_test.go b/proxy/wireguard/packet_gate_test.go
+new file mode 100644
+index 0000000..7453267
+--- /dev/null
++++ b/proxy/wireguard/packet_gate_test.go
+@@ -0,0 +1,215 @@
++package wireguard
++
++import (
++	"context"
++	"crypto/rand"
++	"fmt"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/xtls/xray-core/common/protocol"
++	"golang.org/x/crypto/curve25519"
++	"golang.zx2c4.com/wireguard/conn/bindtest"
++	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/tun/tuntest"
++)
++
++type wgTestGate func(context.Context, string, int) error
++
++func (g wgTestGate) VanillaProxyWaitWireGuardPacket(ctx context.Context, id string, n int) error {
++	return g(ctx, id, n)
++}
++
++func (wgTestGate) VanillaProxyWireGuardClients(context.Context, []*protocol.MemoryUser) (map[[32]byte]string, bool, error) {
++	return nil, false, nil
++}
++
++func (wgTestGate) VanillaProxyMarkWireGuardFlow(ctx context.Context) (context.Context, error) {
++	return ctx, nil
++}
++
++func wgTestUser(email string, key [32]byte, prefix string) *protocol.MemoryUser {
++	return &protocol.MemoryUser{
++		Email: email,
++		Account: &MemoryAccount{
++			Pub: key, AllowedIPs: []netip.Prefix{netip.MustParsePrefix(prefix)},
++		},
++	}
++}
++
++func TestWireGuardGatePolicyRejectsAmbiguityAndFreezesNativePeers(t *testing.T) {
++	a, b := [32]byte{1}, [32]byte{2}
++	alice := wgTestUser("alice", a, "10.0.0.2/32")
++	bob := wgTestUser("bob", b, "fd00::3/128")
++	ids := map[[32]byte]string{a: "shared", b: "shared"}
++	gate := wgTestGate(func(context.Context, string, int) error { return nil })
++	policy, err := newPacketGatePolicy(gate, [32]byte{9}, []*protocol.MemoryUser{alice, bob}, ids)
++	require.NoError(t, err)
++	s := &Server{packetPolicy: policy}
++	require.True(t, s.VanillaProxyWireGuardPacketGateEnabled())
++	require.Error(t, s.AddUser(t.Context(), wgTestUser("new", [32]byte{3}, "10.8.8.8/32")))
++	require.Error(t, s.RemoveUser(t.Context(), alice.Email))
++	first := policy.route(netip.MustParseAddr("10.0.0.2"))
++	second := policy.route(netip.MustParseAddr("fd00::3"))
++	require.Same(t, first.client, second.client)
++	require.Same(t, alice, s.GetUserByAddr(t.Context(), netip.MustParseAddr("::ffff:10.0.0.2")))
++	require.Same(t, bob, s.GetUserByAddr(t.Context(), netip.MustParseAddr("fd00::3")))
++	require.Nil(t, s.GetUserByAddr(t.Context(), netip.MustParseAddr("fd00::4")))
++
++	for _, peer := range []*protocol.MemoryUser{
++		wgTestUser("duplicate key", a, "10.1.0.0/16"),
++		wgTestUser("overlap", b, "10.0.0.31/24"),
++		wgTestUser("mapped IPv6", b, "::ffff:10.0.1.2/128"),
++		wgTestUser("unknown key", [32]byte{3}, "10.1.0.0/16"),
++	} {
++		t.Run(peer.Email, func(t *testing.T) {
++			_, err := newPacketGatePolicy(gate, [32]byte{9}, []*protocol.MemoryUser{alice, peer}, ids)
++			require.Error(t, err)
++		})
++	}
++}
++
++func wireGuardGateReceive[T any](t *testing.T, from <-chan T) T {
++	t.Helper()
++	select {
++	case value := <-from:
++		return value
++	case <-time.After(5 * time.Second):
++		t.Fatal("timed out waiting for WireGuard packet")
++		var zero T
++		return zero
++	}
++}
++
++func wireGuardGateSend(t *testing.T, to chan<- []byte, packet []byte) {
++	t.Helper()
++	select {
++	case to <- packet:
++	case <-time.After(5 * time.Second):
++		t.Fatal("timed out sending WireGuard packet")
++	}
++}
++
++func TestWireGuardGateEncryptedTransportBeforeAndAfterAdmission(t *testing.T) {
++	var serverKey, clientKey, serverPub, clientPub [32]byte
++	_, err := rand.Read(serverKey[:])
++	require.NoError(t, err)
++	_, err = rand.Read(clientKey[:])
++	require.NoError(t, err)
++	curve25519.ScalarBaseMult(&serverPub, &serverKey)
++	curve25519.ScalarBaseMult(&clientPub, &clientKey)
++	clientAddr := netip.MustParseAddr("10.0.0.2")
++	serverAddr := netip.MustParseAddr("10.0.0.1")
++	client := wgTestUser("peer", clientPub, "10.0.0.2/32")
++	other := wgTestUser("unused", [32]byte{3}, "10.0.0.3/32")
++	type admission struct {
++		id string
++		n  int
++	}
++	requests := make(chan admission, 2)
++	grants := make(chan struct{})
++	gate := wgTestGate(func(ctx context.Context, id string, n int) error {
++		select {
++		case requests <- admission{id, n}:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++		select {
++		case <-grants:
++			return nil
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	})
++	policy, err := newPacketGatePolicy(gate, serverPub, []*protocol.MemoryUser{client, other}, map[[32]byte]string{clientPub: "account", {3}: "other"})
++	require.NoError(t, err)
++	serverTUN, clientTUN := tuntest.NewChannelTUN(), tuntest.NewChannelTUN()
++	binds := bindtest.NewChannelBinds()
++	server := device.NewDevice(newPacketGateTun(serverTUN.TUN(), policy), binds[0], device.NewLogger(device.LogLevelSilent, ""))
++	t.Cleanup(server.Close)
++	peer := device.NewDevice(clientTUN.TUN(), binds[1], device.NewLogger(device.LogLevelSilent, ""))
++	t.Cleanup(peer.Close)
++	require.NoError(t, server.IpcSet(fmt.Sprintf("private_key=%x\npublic_key=%x\nallowed_ip=%s/32\npublic_key=%x\nallowed_ip=10.0.0.3/32\n", serverKey, clientPub, clientAddr, [32]byte{3})))
++	require.NoError(t, peer.IpcSet(fmt.Sprintf("private_key=%x\npublic_key=%x\nallowed_ip=%s/32\nendpoint=127.0.0.1:4\n", clientKey, serverPub, serverAddr)))
++	require.NoError(t, server.Up())
++	require.NoError(t, peer.Up())
++
++	upload := tuntest.Ping(serverAddr, clientAddr)
++	wireGuardGateSend(t, clientTUN.Outbound, upload)
++	require.Equal(t, admission{"account", len(upload)}, wireGuardGateReceive(t, requests))
++	select {
++	case <-serverTUN.Inbound:
++		t.Fatal("upload was delivered before admission")
++	default:
++	}
++	grants <- struct{}{}
++	require.Equal(t, upload, wireGuardGateReceive(t, serverTUN.Inbound))
++
++	// An inner address configured for a different peer must never reach
++	// the gate even though this transport session itself authenticated.
++	wrongSource := tuntest.Ping(serverAddr, netip.MustParseAddr("10.0.0.3"))
++	wireGuardGateSend(t, clientTUN.Outbound, wrongSource)
++	wireGuardGateSend(t, clientTUN.Outbound, upload)
++	require.Equal(t, admission{"account", len(upload)}, wireGuardGateReceive(t, requests))
++	grants <- struct{}{}
++	require.Equal(t, upload, wireGuardGateReceive(t, serverTUN.Inbound))
++
++	down := tuntest.Ping(clientAddr, serverAddr)
++	wireGuardGateSend(t, serverTUN.Outbound, down)
++	require.Equal(t, admission{"account", len(down)}, wireGuardGateReceive(t, requests))
++	select {
++	case <-clientTUN.Inbound:
++		t.Fatal("download was delivered before admission")
++	default:
++	}
++	grants <- struct{}{}
++	require.Equal(t, down, wireGuardGateReceive(t, clientTUN.Inbound))
++}
++
++func TestWireGuardGateBlockedAccountDoesNotBlockOtherPacketLanes(t *testing.T) {
++	a, b := [32]byte{1}, [32]byte{2}
++	users := []*protocol.MemoryUser{wgTestUser("alice", a, "10.0.0.2/32"), wgTestUser("bob", b, "10.0.0.3/32")}
++	blocked := make(chan struct{}, 1)
++	gate := wgTestGate(func(ctx context.Context, id string, n int) error {
++		if id == "alice" && n == 32 {
++			blocked <- struct{}{}
++			<-ctx.Done()
++			return ctx.Err()
++		}
++		return nil
++	})
++	policy, err := newPacketGatePolicy(gate, [32]byte{9}, users, map[[32]byte]string{a: "alice", b: "bob"})
++	require.NoError(t, err)
++	stack := tuntest.NewChannelTUN()
++	wrapped := newPacketGateTun(stack.TUN(), policy)
++	t.Cleanup(func() { require.NoError(t, wrapped.Close()) })
++	serverAddr := netip.MustParseAddr("10.0.0.1")
++	alice := netip.MustParseAddr("10.0.0.2")
++	bob := netip.MustParseAddr("10.0.0.3")
++	alicePacket := tuntest.Ping(serverAddr, alice)
++	written, err := wrapped.Write([][]byte{alicePacket}, 0)
++	require.NoError(t, err)
++	require.Equal(t, 1, written)
++	wireGuardGateReceive(t, blocked)
++	for range 2 * packetsPerAccountDirection {
++		_, err := wrapped.Write([][]byte{alicePacket}, 0)
++		require.NoError(t, err)
++	}
++	require.Len(t, policy.clients["alice"].lane[packetUpload].slots, packetsPerAccountDirection)
++	bobPacket := tuntest.Ping(serverAddr, bob)
++	_, err = wrapped.Write([][]byte{bobPacket}, 0)
++	require.NoError(t, err)
++	require.Equal(t, bobPacket, wireGuardGateReceive(t, stack.Inbound))
++	aliceDownload := append(tuntest.Ping(alice, serverAddr), 0)
++	wireGuardGateSend(t, stack.Outbound, aliceDownload)
++	ready := make(chan []byte, 1)
++	go func() {
++		buffer := make([]byte, 1420)
++		sizes := make([]int, 1)
++		_, _ = wrapped.Read([][]byte{buffer}, sizes, 0)
++		ready <- buffer[:sizes[0]]
++	}()
++	require.Equal(t, aliceDownload, wireGuardGateReceive(t, ready))
++}
+diff --git a/proxy/wireguard/server.go b/proxy/wireguard/server.go
+index 0e7ff86..e3dfba6 100644
+--- a/proxy/wireguard/server.go
++++ b/proxy/wireguard/server.go
+@@ -9,7 +9,6 @@ import (
+ 	"strings"
+ 	"sync"
+ 
+-	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+ 	c "github.com/xtls/xray-core/common/ctx"
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -43,9 +42,10 @@ type Server struct {
+ 	uplinkCounter   stats.Counter
+ 	downlinkCounter stats.Counter
+ 
+-	tun tun.Device
+-	dev *device.Device
+-	mu  sync.Mutex
++	tun          tun.Device
++	dev          *device.Device
++	mu           sync.Mutex
++	packetPolicy *packetGatePolicy
+ 
+ 	pub   [32]byte
+ 	users *sync.Map
+@@ -94,17 +94,26 @@ func NewServer(ctx context.Context, conf *DeviceConfig) (*Server, error) {
+ 		return nil, err
+ 	}
+ 
+-	pri := common.Must2(ParseKey(conf.SecretKey))
++	pri, err := ParseKey(conf.SecretKey)
++	if err != nil {
++		return nil, errors.New("invalid WireGuard server key").Base(err)
++	}
+ 	var pub [32]byte
+ 	curve25519.ScalarBaseMult(&pub, pri)
+ 
+ 	users := &sync.Map{}
++	peers := make([]*protocol.MemoryUser, 0, len(conf.Users))
+ 	for _, u := range conf.Users {
+ 		user, err := u.ToMemoryUser()
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		users.Store(user.Account.(*MemoryAccount).Pub, user)
++		peer, ok := user.Account.(*MemoryAccount)
++		if !ok || peer == nil {
++			return nil, errors.New("invalid WireGuard peer account")
++		}
++		users.Store(peer.Pub, user)
++		peers = append(peers, user)
+ 	}
+ 
+ 	s := &Server{
+@@ -123,16 +132,40 @@ func NewServer(ctx context.Context, conf *DeviceConfig) (*Server, error) {
+ 		pub:   pub,
+ 		users: users,
+ 	}
++	if gate, ok := d.(wireGuardPacketGate); ok {
++		identity := *inbound
++		identity.Name = "wireguard"
++		identity.User = nil
++		clientIDs, managed, err := gate.VanillaProxyWireGuardClients(session.ContextWithInbound(ctx, &identity), peers)
++		if err != nil {
++			return nil, err
++		}
++		if managed {
++			if *pri == ([32]byte{}) {
++				return nil, errors.New("empty managed WireGuard server key")
++			}
++			s.packetPolicy, err = newPacketGatePolicy(gate, pub, peers, clientIDs)
++			if err != nil {
++				return nil, err
++			}
++		}
++	}
+ 	// The stack hands its connections to s from the first packet on, which the device delivers after Start -> dev.Up.
+ 	tun, _, err := CreateNetTUN(localAddresses, nil, int(conf.Mtu), s)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	s.tun = tun
++	if s.packetPolicy != nil {
++		s.tun = newPacketGateTun(tun, s.packetPolicy)
++	}
+ 	return s, nil
+ }
+ 
+ func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
++	if s.packetPolicy != nil {
++		return errors.New("managed WireGuard peers require inbound recreation")
++	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	if s.dev == nil {
+@@ -163,6 +196,9 @@ func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
+ }
+ 
+ func (s *Server) RemoveUser(ctx context.Context, email string) error {
++	if s.packetPolicy != nil {
++		return errors.New("managed WireGuard peers require inbound recreation")
++	}
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	if s.dev == nil {
+@@ -191,6 +227,12 @@ func (s *Server) GetUser(ctx context.Context, email string) (user *protocol.Memo
+ }
+ 
+ func (s *Server) GetUserByAddr(ctx context.Context, addr netip.Addr) (user *protocol.MemoryUser) {
++	if s.packetPolicy != nil {
++		if route := s.packetPolicy.route(addr.Unmap()); route != nil {
++			return route.user
++		}
++		return nil
++	}
+ 	s.users.Range(func(key, value any) bool {
+ 		peer := value.(*protocol.MemoryUser).Account.(*MemoryAccount)
+ 		for i := range peer.AllowedIPs {
+@@ -252,6 +294,9 @@ func (s *Server) Start() error {
+ 	if s.dev != nil {
+ 		return nil
+ 	}
++	if s.tun == nil {
++		return errors.New("WireGuard server TUN is closed")
++	}
+ 	if s.src.Address.Family().IsDomain() {
+ 		return errors.New("address is domain")
+ 	}
+@@ -311,10 +356,14 @@ func (s *Server) Start() error {
+ 	})
+ 	err := dev.IpcSet(cfg.String())
+ 	if err != nil {
++		dev.Close()
++		s.tun = nil
+ 		return err
+ 	}
+ 	err = dev.Up()
+ 	if err != nil {
++		dev.Close()
++		s.tun = nil
+ 		return err
+ 	}
+ 	s.dev = dev
+@@ -364,6 +413,14 @@ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
+ 		SniffingRequest: s.sniffingRequest,
+ 	})
+ 	ctx = session.SubContextFromMuxInbound(ctx)
++	if s.packetPolicy != nil {
++		marked, err := s.packetPolicy.gate.VanillaProxyMarkWireGuardFlow(ctx)
++		if err != nil {
++			errors.LogError(ctx, errors.New("cannot bind managed WireGuard flow").Base(err))
++			return
++		}
++		ctx = marked
++	}
+ 
+ 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+ 		From:   inbound.Source,

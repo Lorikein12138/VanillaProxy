@@ -2,6 +2,7 @@ package database
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +46,14 @@ func TestCopyAllModelsIntoSQLite(t *testing.T) {
 	if err := src.Create(&xray.ClientTraffic{InboundId: 1, Email: "a@b.c", Enable: true, Up: 10, Down: 20}).Error; err != nil {
 		t.Fatalf("seed traffic: %v", err)
 	}
+	client := model.ClientRecord{Email: "a@b.c"}
+	if err := src.Create(&client).Error; err != nil {
+		t.Fatalf("seed client: %v", err)
+	}
+	policy := model.ClientBandwidth{ClientID: client.Id, TotalBitsPerSecond: 120000, NodeBitsPerSecond: map[string]int64{"local": 0, "guid:remote": 80000}}
+	if err := src.Create(&policy).Error; err != nil {
+		t.Fatalf("seed bandwidth policy: %v", err)
+	}
 
 	dst, err := gorm.Open(sqlite.Open(dstPath), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
@@ -79,6 +88,10 @@ func TestCopyAllModelsIntoSQLite(t *testing.T) {
 	}
 	if ct.Up != 10 || ct.Down != 20 || !ct.Enable {
 		t.Errorf("traffic mismatch: %+v", ct)
+	}
+	var copied model.ClientBandwidth
+	if err := dst.Where("client_id = ?", client.Id).First(&copied).Error; err != nil || copied.TotalBitsPerSecond != policy.TotalBitsPerSecond || !maps.Equal(copied.NodeBitsPerSecond, policy.NodeBitsPerSecond) {
+		t.Fatalf("bandwidth policy copy = %+v, %v, want %+v", copied, err, policy)
 	}
 }
 

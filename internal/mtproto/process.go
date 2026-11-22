@@ -3,14 +3,17 @@
 // protocol, so mtproto inbounds are run as standalone mtg processes — one
 // process per inbound, each serving every active client's secret through the
 // mtg-multi [secrets] section — entirely outside the Xray config and lifecycle.
-// A client edit is hot-applied via the fork's POST /reload endpoint so live
-// connections survive; the manager falls back to a restart on older binaries.
+// Stock mtg can apply client edits through its management API while the process
+// serves connections. Shared bandwidth mode restarts to apply client edits.
 package mtproto
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,6 +25,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/xraybandwidthchild/launch"
 )
 
 // GetBinaryName returns the mtg binary filename for the current OS and arch,
@@ -49,8 +53,9 @@ func configPathForID(id int) string {
 }
 
 var (
-	gracefulStopTimeout = 5 * time.Second
-	forceStopTimeout    = 2 * time.Second
+	gracefulStopTimeout   = 5 * time.Second
+	forceStopTimeout      = 2 * time.Second
+	bandwidthReadyTimeout = 15 * time.Second
 )
 
 // procLogWriter consumes the mtg child process's stdout/stderr. It splits the
@@ -109,13 +114,14 @@ func (w *procLogWriter) LastLine() string {
 
 // Process wraps a single mtg process invocation for one mtproto inbound.
 type Process struct {
-	mu              sync.RWMutex
-	cmd             *exec.Cmd
-	done            chan struct{}
-	configPath      string
-	logWriter       *procLogWriter
-	exitErr         error
-	intentionalStop atomic.Bool
+	bandwidthHandshake []byte
+	mu                 sync.RWMutex
+	cmd                *exec.Cmd
+	done               chan struct{}
+	configPath         string
+	logWriter          *procLogWriter
+	exitErr            error
+	intentionalStop    atomic.Bool
 }
 
 func newProcess(configPath, label string) *Process {
@@ -159,29 +165,77 @@ func (p *Process) GetResult() string {
 
 // Start launches the mtg process against its generated config file.
 func (p *Process) Start() error {
-	if p.IsRunning() {
-		return errors.New("mtg is already running")
+	var listener *net.TCPListener
+	var ready launch.Ready
+	var err error
+	if p.bandwidthHandshake != nil {
+		listener, ready, err = newBandwidthReadiness()
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
 	}
-	cmd := exec.CommandContext(context.Background(), GetBinaryPath(), "run", p.configPath)
+	cmd, err := p.startCommand(ready)
+	if err != nil {
+		return err
+	}
+	done, err := p.launch(cmd)
+	if err != nil || listener == nil {
+		return err
+	}
+	if err := waitBandwidthReady(listener, ready, done, bandwidthReadyTimeout); err != nil {
+		killErr := cmd.Process.Kill()
+		if errors.Is(killErr, os.ErrProcessDone) {
+			killErr = nil
+		}
+		return errors.Join(err, killErr, waitForExit(done, forceStopTimeout))
+	}
+	return nil
+}
+
+func (p *Process) launch(cmd *exec.Cmd) (<-chan struct{}, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd != nil {
+		select {
+		case <-p.done:
+		default:
+			return nil, errors.New("mtg is already running")
+		}
+	}
 	cmd.Stdout = p.logWriter
 	cmd.Stderr = p.logWriter
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	attachChildLifetime(cmd)
 	done := make(chan struct{})
-	p.mu.Lock()
 	p.cmd = cmd
 	p.done = done
 	p.exitErr = nil
-	p.mu.Unlock()
 	p.intentionalStop.Store(false)
-	if err := cmd.Start(); err != nil {
-		close(done)
-		p.mu.Lock()
-		p.cmd = nil
-		p.mu.Unlock()
-		return err
-	}
-	attachChildLifetime(cmd)
 	go p.wait(cmd, done)
-	return nil
+	return done, nil
+}
+
+func (p *Process) startCommand(ready launch.Ready) (*exec.Cmd, error) {
+	if p.bandwidthHandshake == nil {
+		return exec.CommandContext(context.Background(), GetBinaryPath(), "run", p.configPath), nil
+	}
+	if !ready.Valid() {
+		return nil, errors.New("mtproto: invalid readiness challenge")
+	}
+	bootstrap := bandwidthBootstrap{Ready: ready}
+	if err := json.Unmarshal(p.bandwidthHandshake, &bootstrap.BandwidthOptions); err != nil {
+		return nil, errors.New("mtproto: invalid bandwidth launch snapshot")
+	}
+	payload, err := json.Marshal(bootstrap)
+	if err != nil || len(payload) > maxBandwidthHandshakeSize {
+		return nil, errors.New("mtproto: invalid or oversized bandwidth bootstrap")
+	}
+	cmd := exec.CommandContext(context.Background(), GetBinaryPath(), "run", bandwidthFlag, p.configPath)
+	cmd.Stdin = bytes.NewReader(payload)
+	return cmd, nil
 }
 
 func (p *Process) wait(cmd *exec.Cmd, done chan struct{}) {

@@ -13,6 +13,9 @@ import (
 // buildClientUAPIConfig renders a client-mode UAPI set string: the device
 // lines of buildUAPIConfig plus per-peer endpoint/keepalive for dialing.
 func buildClientUAPIConfig(inst amneziawg.OutboundInstance, opts DeviceOptions) (string, error) {
+	if opts.Bandwidth != nil {
+		return "", fmt.Errorf("amneziawgnet: bandwidth options require a server device")
+	}
 	var b strings.Builder
 
 	privHex, err := wireguard.KeyToHex(inst.PrivateKey)
@@ -98,6 +101,9 @@ func buildClientUAPIConfig(inst amneziawg.OutboundInstance, opts DeviceOptions) 
 // newUnconfiguredClientDevice builds the tun/netstack/device trio for a
 // client-mode instance; same construction rules as newUnconfiguredDevice.
 func newUnconfiguredClientDevice(inst amneziawg.OutboundInstance, opts DeviceOptions) (*Device, error) {
+	if opts.Bandwidth != nil {
+		return nil, fmt.Errorf("amneziawgnet: bandwidth options require a server device")
+	}
 	addrs, err := hostAddresses(inst.Address)
 	if err != nil {
 		return nil, fmt.Errorf("amneziawgnet: %w", err)
@@ -117,12 +123,15 @@ func newUnconfiguredClientDevice(inst amneziawg.OutboundInstance, opts DeviceOpt
 	bind := newResolvingBind("")
 	dev := device.NewDevice(tun, bind, logger)
 
-	return &Device{Device: dev, Stack: gstack, localAddrs: addrs}, nil
+	return &Device{engine: dev, Stack: gstack, localAddrs: addrs}, nil
 }
 
 // ConfigureClient applies inst/opts via UAPI and brings the interface up;
 // same single-call contract as Configure.
 func (d *Device) ConfigureClient(inst amneziawg.OutboundInstance, opts DeviceOptions) error {
+	if d.bandwidthConfig != "" {
+		return errFixedBandwidthDevice
+	}
 	conf, err := buildClientUAPIConfig(inst, opts)
 	if err != nil {
 		d.Close()

@@ -44,6 +44,18 @@ func (s *XraySettingService) SaveXraySetting(newXraySettings string) error {
 	if spelled, changed, err := database.RewriteDNSOutboundQTypeZero(newXraySettings); err == nil && changed {
 		newXraySettings = spelled
 	}
+	if node := activeBandwidthNode.Load(); node != nil {
+		var candidate xray.Config
+		if err := json.Unmarshal([]byte(newXraySettings), &candidate); err != nil {
+			return common.NewError("xray template config invalid:", err)
+		}
+		if err := validateSavedBandwidthXrayTemplate(&candidate, node.panel.AccountID); err != nil {
+			return err
+		}
+		if err := validateBandwidthTemplateInboundTags(database.GetDB(), candidate.InboundConfigs); err != nil {
+			return err
+		}
+	}
 	return s.saveSetting("xrayTemplateConfig", newXraySettings)
 }
 

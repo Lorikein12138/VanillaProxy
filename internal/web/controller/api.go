@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/bandwidthruntime"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/middleware"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
@@ -29,8 +30,12 @@ type APIController struct {
 
 // NewAPIController creates a new APIController instance and initializes its routes.
 func NewAPIController(g *gin.RouterGroup) *APIController {
+	return NewAPIControllerWithBandwidth(g, nil)
+}
+
+func NewAPIControllerWithBandwidth(g *gin.RouterGroup, bandwidth *bandwidthruntime.PanelRuntime) *APIController {
 	a := &APIController{}
-	a.initRouter(g)
+	a.initRouter(g, bandwidth)
 	return a
 }
 
@@ -190,7 +195,7 @@ func relAPIPath(fullPath string) string {
 }
 
 // initRouter sets up the API routes for inbounds, server, and other endpoints.
-func (a *APIController) initRouter(g *gin.RouterGroup) {
+func (a *APIController) initRouter(g *gin.RouterGroup, bandwidth *bandwidthruntime.PanelRuntime) {
 	// Main API group
 	api := g.Group("/panel/api")
 	api.Use(a.checkAPIAuth)
@@ -207,7 +212,7 @@ func (a *APIController) initRouter(g *gin.RouterGroup) {
 	a.inboundController = NewInboundController(inbounds)
 
 	clients := api.Group("/clients")
-	NewClientController(clients)
+	newClientController(clients, bandwidth)
 	NewGroupController(clients)
 
 	// Server API

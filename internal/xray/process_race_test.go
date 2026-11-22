@@ -100,3 +100,40 @@ func TestProcessVersionAPIPortRaceSafe(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestCrashHandlerReplacementRaceSafe(t *testing.T) {
+	t.Cleanup(func() { SetCrashHandler(nil) })
+	crash := errors.New("child crashed")
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 100 {
+			SetCrashHandler(func(error) {})
+			SetCrashHandler(nil)
+		}
+	})
+	wg.Go(func() {
+		for range 100 {
+			reportCrash(crash)
+		}
+	})
+	wg.Wait()
+
+	called := make(chan error, 1)
+	SetCrashHandler(func(err error) {
+		replaced := make(chan struct{})
+		go func() {
+			SetCrashHandler(nil)
+			close(replaced)
+		}()
+		select {
+		case <-replaced:
+			called <- err
+		case <-time.After(time.Second):
+			called <- nil
+		}
+	})
+	reportCrash(crash)
+	if got := <-called; !errors.Is(got, crash) {
+		t.Fatalf("crash notification did not allow callback replacement: %v", got)
+	}
+}

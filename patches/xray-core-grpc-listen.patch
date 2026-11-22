@@ -1,0 +1,104 @@
+diff --git a/transport/internet/grpc/config.go b/transport/internet/grpc/config.go
+--- a/transport/internet/grpc/config.go
++++ b/transport/internet/grpc/config.go
+@@ -14,6 +14,9 @@
+ 	}))
+ }
+ 
++// VanillaProxySynchronousGRPCListenV1 reports that Listen binds before returning.
++func (*Config) VanillaProxySynchronousGRPCListenV1() {}
++
+ func (c *Config) getServiceName() string {
+ 	// Normal old school config
+ 	if !strings.HasPrefix(c.ServiceName, "/") {
+diff --git a/transport/internet/grpc/hub.go b/transport/internet/grpc/hub.go
+--- a/transport/internet/grpc/hub.go
++++ b/transport/internet/grpc/hub.go
+@@ -25,7 +25,8 @@
+ 	config               *Config
+ 	trustedXForwardedFor []string
+ 
+-	s *grpc.Server
++	s         *grpc.Server
++	serveDone chan struct{}
+ }
+ 
+ func (l Listener) Tun(server encoding.GRPCService_TunServer) error {
+@@ -44,6 +45,8 @@
+ 
+ func (l Listener) Close() error {
+ 	l.s.Stop()
++	// Serve also closes the listener if Stop ran before it started.
++	<-l.serveDone
+ 	return nil
+ }
+ 
+@@ -82,7 +85,6 @@
+ 	config := tls.ConfigFromStreamSettings(settings)
+ 
+ 	var options []grpc.ServerOption
+-	var s *grpc.Server
+ 	if config != nil {
+ 		// gRPC server may silently ignore TLS errors
+ 		options = append(options, grpc.Creds(credentials.NewTLS(config.GetTLSConfig(tls.WithNextProto("h2")))))
+@@ -94,39 +96,32 @@
+ 		}))
+ 	}
+ 
+-	s = grpc.NewServer(options...)
+-	listener.s = s
+-
+ 	if settings.SocketSettings != nil && settings.SocketSettings.AcceptProxyProtocol {
+ 		errors.LogWarning(ctx, "accepting PROXY protocol")
+ 	}
+ 
+-	go func() {
+-		var streamListener net.Listener
+-		var err error
+-		var addr net.Addr
+-		if port == net.Port(0) { // unix
+-			addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
+-		} else { // tcp
+-			addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
+-		}
+-		if settings.FinalMask != nil {
+-			streamListener, err = settings.FinalMask.Listen(ctx, addr)
+-		} else {
+-			streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
+-		}
+-		if err != nil {
+-			errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
+-			return
+-		}
+-
+-		errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
+-		encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
++	var streamListener net.Listener
++	var err error
++	if settings.FinalMask != nil {
++		streamListener, err = settings.FinalMask.Listen(ctx, listener.local)
++	} else {
++		streamListener, err = internet.ListenSystem(ctx, listener.local, settings.SocketSettings)
++	}
++	if err != nil {
++		return nil, errors.New("failed to listen on ", address, ":", port).Base(err)
++	}
++	if config := reality.ConfigFromStreamSettings(settings); config != nil {
++		streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
++	}
+ 
+-		if config := reality.ConfigFromStreamSettings(settings); config != nil {
+-			streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
+-		}
+-		if err = s.Serve(streamListener); err != nil {
++	s := grpc.NewServer(options...)
++	listener.s = s
++	listener.serveDone = make(chan struct{})
++	errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
++	encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
++	go func() {
++		defer close(listener.serveDone)
++		if err := s.Serve(streamListener); err != nil && err != grpc.ErrServerStopped {
+ 			errors.LogInfoInner(ctx, err, "Listener for gRPC ended")
+ 		}
+ 	}()

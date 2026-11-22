@@ -33,6 +33,10 @@ type SocksRelay struct {
 	InboundID int
 	Addr      string // e.g. "127.0.0.1:63201"
 	Password  string // internal shared password for the SOCKS inbound
+
+	// RequireBoundUDP requires a loopback relay with password authentication
+	// for TCP and UDP, and advertises the actual UDP socket in UDP ASSOCIATE.
+	RequireBoundUDP bool
 }
 
 // CountingConn wraps a net.Conn and tracks bytes read and written atomically.
@@ -78,7 +82,7 @@ func (r *SocksRelay) DialTCP(ctx context.Context, user string, target *Address) 
 		return nil, fmt.Errorf("tuic socks: send CONNECT request: %w", err)
 	}
 
-	if _, err := readSocks5Reply(conn); err != nil {
+	if _, err := readSocks5Reply(conn, false); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -93,6 +97,18 @@ func (r *SocksRelay) DialTCP(ctx context.Context, user string, target *Address) 
 }
 
 func (r *SocksRelay) dialAuthenticated(ctx context.Context, user string) (net.Conn, error) {
+	if r.RequireBoundUDP {
+		endpoint, err := netip.ParseAddrPort(r.Addr)
+		if err != nil || !endpoint.Addr().Unmap().IsLoopback() || endpoint.Port() == 0 {
+			return nil, errors.New("tuic socks: bound relay requires a loopback IP and port")
+		}
+		if len(r.Password) == 0 || len(r.Password) > 255 {
+			return nil, errors.New("tuic socks: bound relay password must contain 1 to 255 bytes")
+		}
+		if err := ValidateRelayEmail(user); err != nil {
+			return nil, err
+		}
+	}
 	if r.Gate != nil {
 		waiting, cancel := context.WithTimeout(ctx, relayOpenTimeout)
 		release, err := r.Gate.acquire(waiting, r.InboundID, user)
@@ -107,10 +123,18 @@ func (r *SocksRelay) dialAuthenticated(ctx context.Context, user string) (net.Co
 	if err != nil {
 		return nil, fmt.Errorf("tuic socks: dial relay %s: %w", r.Addr, err)
 	}
+	if r.RequireBoundUDP {
+		local := conn.LocalAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		remote := conn.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		if !local.IsLoopback() || !remote.IsLoopback() {
+			_ = conn.Close()
+			return nil, errors.New("tuic socks: bound relay control connection must use loopback")
+		}
+	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := socks5Handshake(conn, user, r.Password); err != nil {
+	if err := socks5Handshake(conn, user, r.Password, r.RequireBoundUDP); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -175,11 +199,11 @@ func buildSocks5ConnectRequest(target *Address) []byte {
 
 // SocksUDPSession manages a SOCKS5 UDP ASSOCIATE tunnel to Xray.
 type SocksUDPSession struct {
-	ctrl     net.Conn
-	udpConn  *net.UDPConn
-	targetEP net.Addr
-	user     string
-	closed   atomic.Bool
+	ctrl       net.Conn
+	udpConn    *net.UDPConn
+	boundRelay netip.AddrPort // set when udpConn is a pre-bound, unconnected socket
+	user       string
+	closed     atomic.Bool
 }
 
 // DialUDP establishes a SOCKS5 UDP ASSOCIATE tunnel to Xray.
@@ -191,36 +215,67 @@ func (r *SocksRelay) DialUDP(ctx context.Context, user string) (*SocksUDPSession
 	stop := context.AfterFunc(ctx, func() { _ = ctrl.Close() })
 	defer stop()
 
-	// SOCKS5 UDP ASSOCIATE (0x03), dst 0.0.0.0:0
-	if _, err := ctrl.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-		ctrl.Close()
+	var udpConn *net.UDPConn
+	ready := false
+	defer func() {
+		if !ready {
+			_ = ctrl.Close()
+			if udpConn != nil {
+				_ = udpConn.Close()
+			}
+		}
+	}()
+
+	associate := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	if r.RequireBoundUDP {
+		localIP := ctrl.LocalAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		udpConn, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(localIP, 0)))
+		if err != nil {
+			return nil, fmt.Errorf("tuic socks: bind UDP association socket: %w", err)
+		}
+		localPort := udpConn.LocalAddr().(*net.UDPAddr).AddrPort().Port()
+		addrType := AddrTypeIPv6
+		if localIP.Is4() {
+			addrType = AddrTypeIPv4
+		}
+		associate = buildSocks5ConnectRequest(&Address{Type: addrType, IP: localIP.AsSlice(), Port: localPort})
+		associate[1] = 0x03
+	}
+	if _, err := ctrl.Write(associate); err != nil {
 		return nil, fmt.Errorf("tuic socks: send UDP ASSOCIATE request: %w", err)
 	}
 
-	bind, err := readSocks5Reply(ctrl)
+	bind, err := readSocks5Reply(ctrl, r.RequireBoundUDP)
 	if err != nil {
-		ctrl.Close()
 		return nil, err
 	}
 
+	var boundRelay netip.AddrPort
+	if r.RequireBoundUDP {
+		remoteIP := ctrl.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()
+		bindIP := bind.Addr().Unmap()
+		if !bindIP.IsLoopback() || bindIP != remoteIP || bind.Port() == 0 {
+			return nil, fmt.Errorf("tuic socks: invalid bound UDP relay endpoint %s", bind)
+		}
+		boundRelay = netip.AddrPortFrom(bindIP, bind.Port())
+	} else {
+		udpConn, err = net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bind))
+		if err != nil {
+			return nil, fmt.Errorf("tuic socks: dial UDP relay endpoint %s: %w", bind, err)
+		}
+	}
 	_ = ctrl.SetDeadline(time.Time{})
-
-	udpConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bind))
-	if err != nil {
-		ctrl.Close()
-		return nil, fmt.Errorf("tuic socks: dial UDP relay endpoint %s: %w", bind, err)
-	}
+	stop()
 	if err := ctx.Err(); err != nil {
-		_ = ctrl.Close()
-		_ = udpConn.Close()
 		return nil, err
 	}
 
+	ready = true
 	return &SocksUDPSession{
-		ctrl:     ctrl,
-		udpConn:  udpConn,
-		targetEP: udpConn.RemoteAddr(),
-		user:     user,
+		ctrl:       ctrl,
+		udpConn:    udpConn,
+		boundRelay: boundRelay,
+		user:       user,
 	}, nil
 }
 
@@ -235,6 +290,9 @@ func (s *SocksUDPSession) Send(target *Address, payload []byte) (int, error) {
 		return 0, err
 	}
 
+	if s.boundRelay.IsValid() {
+		return s.udpConn.WriteToUDPAddrPort(packet, s.boundRelay)
+	}
 	return s.udpConn.Write(packet)
 }
 
@@ -258,7 +316,7 @@ func (s *SocksUDPSession) Receive(buf []byte) (*Address, []byte, error) {
 		return nil, nil, net.ErrClosed
 	}
 
-	n, err := s.udpConn.Read(buf)
+	n, err := s.readUDP(buf)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -305,6 +363,22 @@ func (s *SocksUDPSession) Receive(buf []byte) (*Address, []byte, error) {
 	}
 
 	return addr, buf[offset:n], nil
+}
+
+func (s *SocksUDPSession) readUDP(buf []byte) (int, error) {
+	if !s.boundRelay.IsValid() {
+		return s.udpConn.Read(buf)
+	}
+	for {
+		n, source, err := s.udpConn.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			return n, err
+		}
+		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+		if source == s.boundRelay {
+			return n, nil
+		}
+	}
 }
 
 // Close closes the SOCKS5 UDP session.
@@ -368,8 +442,12 @@ func buildSocks5UDPHeader(target *Address) []byte {
 	return hdr
 }
 
-func socks5Handshake(conn net.Conn, user, password string) error {
-	if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+func socks5Handshake(conn net.Conn, user, password string, requirePassword bool) error {
+	greeting := []byte{0x05, 0x02, 0x00, 0x02}
+	if requirePassword {
+		greeting = []byte{0x05, 0x01, 0x02}
+	}
+	if _, err := conn.Write(greeting); err != nil {
 		return fmt.Errorf("tuic socks: send greeting: %w", err)
 	}
 	var resp [2]byte
@@ -378,6 +456,9 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 	}
 	if resp[0] != 0x05 {
 		return fmt.Errorf("tuic socks: unexpected SOCKS version %d", resp[0])
+	}
+	if requirePassword && resp[1] != 0x02 {
+		return fmt.Errorf("tuic socks: relay selected method %d, password authentication required", resp[1])
 	}
 	switch resp[1] {
 	case 0x00: // no auth
@@ -395,6 +476,9 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 		if _, err := io.ReadFull(conn, authResp[:]); err != nil {
 			return fmt.Errorf("tuic socks: read auth reply: %w", err)
 		}
+		if requirePassword && authResp[0] != 0x01 {
+			return fmt.Errorf("tuic socks: unexpected authentication version %d", authResp[0])
+		}
 		if authResp[1] != 0x00 {
 			return fmt.Errorf("tuic socks: auth rejected (code %d)", authResp[1])
 		}
@@ -404,7 +488,7 @@ func socks5Handshake(conn net.Conn, user, password string) error {
 	}
 }
 
-func readSocks5Reply(r io.Reader) (netip.AddrPort, error) {
+func readSocks5Reply(r io.Reader, requireIP bool) (netip.AddrPort, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("tuic socks: read reply header: %w", err)
@@ -414,6 +498,9 @@ func readSocks5Reply(r io.Reader) (netip.AddrPort, error) {
 	}
 	if hdr[1] != 0x00 {
 		return netip.AddrPort{}, fmt.Errorf("tuic socks: request rejected (code %d)", hdr[1])
+	}
+	if requireIP && (hdr[2] != 0 || (hdr[3] != 0x01 && hdr[3] != 0x04)) {
+		return netip.AddrPort{}, errors.New("tuic socks: invalid bound UDP relay reply")
 	}
 	addr, err := readSocks5Addr(r, hdr[3])
 	if err != nil {
@@ -509,8 +596,14 @@ func PipeBiDirectional(a, b io.ReadWriteCloser, upCounter, downCounter *atomic.I
 }
 
 func PipeBiDirectionalContext(ctx context.Context, a, b io.ReadWriteCloser, upCounter, downCounter *atomic.Int64) {
-	closeBoth := func() { _ = a.Close(); _ = b.Close() }
-	stop := context.AfterFunc(ctx, closeBoth)
+	pipeBiDirectionalContext(ctx, a, b, upCounter, downCounter, nil)
+}
+
+func pipeBiDirectionalContext(ctx context.Context, a, b io.ReadWriteCloser, upCounter, downCounter *atomic.Int64, gate func(context.Context, int) error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	closeConns := func() { _ = a.Close(); _ = b.Close() }
+	stop := context.AfterFunc(ctx, closeConns)
 	defer stop()
 	ga := newGuardedReader(a)
 	gb := newGuardedReader(b)
@@ -524,17 +617,21 @@ func PipeBiDirectionalContext(ctx context.Context, a, b io.ReadWriteCloser, upCo
 		for {
 			n, err := src.Read(buf)
 			if n > 0 {
+				if gate != nil && gate(ctx, n) != nil {
+					cancel()
+					break
+				}
 				if counter != nil {
 					counter.Add(int64(n))
 				}
 				if _, werr := dst.Write(buf[:n]); werr != nil {
-					closeBoth()
+					cancel()
 					break
 				}
 			}
 			if err != nil {
 				if !errors.Is(err, io.EOF) {
-					closeBoth()
+					cancel()
 				}
 				break
 			}

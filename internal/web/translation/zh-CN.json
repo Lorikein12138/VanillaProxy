@@ -790,6 +790,21 @@
     "clients": {
       "tabBasics": "基本",
       "tabCredentials": "凭据",
+      "bandwidth": {
+        "tab": "限速",
+        "total": "总带宽上限",
+        "totalHint": "设为 0 时继承启动配额。所有节点共享总带宽上限。",
+        "nodes": "节点带宽上限",
+        "nodeExceedsTotal": "节点带宽上限不能超过总带宽上限。",
+        "nodeHint": "留空继承该节点的默认策略，设为 0 则取消该节点的额外限制。",
+        "nodeVia": "{name} 的下游节点 {id}",
+        "noNodes": "所选入站暂无关联节点。",
+        "inherit": "继承",
+        "local": "本机",
+        "unavailable": "此客户端尚未纳入运行中的限速，仍可保存策略。",
+        "loadError": "无法读取限速策略。",
+        "saveError": "无法保存限速策略。"
+      },
       "tabLinks": "链接",
       "wireguardConfig": "WireGuard 配置",
       "config": "配置",

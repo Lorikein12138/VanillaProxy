@@ -4,11 +4,17 @@ import { Input, Select, Switch } from 'antd';
 import { FormField } from '@/components/form/rhf';
 import AccountsList from './accounts-list';
 
-export default function MixedFields({ mixedUdpOn }: { mixedUdpOn: boolean }) {
+export default function MixedFields({
+  mixedUdpOn,
+  allowBandwidthBinding,
+}: {
+  mixedUdpOn: boolean;
+  allowBandwidthBinding: boolean;
+}) {
   const { t } = useTranslation();
   return (
     <>
-      <AccountsList />
+      <AccountsList protocol="mixed" allowBandwidthBinding={allowBandwidthBinding} />
       <FormField name={['settings', 'auth']} label={t('pages.inbounds.info.auth')}>
         <Select
           options={[

@@ -715,6 +715,17 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 	degradedInbounds := map[int]string{}
 
 	newInboundIDs := make(map[int]struct{})
+	matchedProxyInbounds := make(map[int]*model.Inbound)
+	recordProxyMatch := func(localID int, remote *model.Inbound) {
+		if !snap.HasBandwidthProxyBindings() {
+			return
+		}
+		if _, duplicate := matchedProxyInbounds[localID]; duplicate {
+			matchedProxyInbounds[localID] = nil
+		} else {
+			matchedProxyInbounds[localID] = remote
+		}
+	}
 
 	snapTags := make(map[string]struct{}, len(snap.Inbounds))
 	for _, snapIb := range snap.Inbounds {
@@ -800,6 +811,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				continue
 			}
 			reportedRemoteTagConflict.Delete(fmt.Sprintf("%d:%s", nodeID, snapIb.Tag))
+			settings, _ := model.StripInboundProxyBandwidthBindings(snapIb.Protocol, snapIb.Settings)
 			newIb := model.Inbound{
 				UserId:               defaultUserId,
 				NodeID:               &nodeID,
@@ -808,7 +820,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				Listen:               snapIb.Listen,
 				Port:                 snapIb.Port,
 				Protocol:             snapIb.Protocol,
-				Settings:             snapIb.Settings,
+				Settings:             settings,
 				StreamSettings:       snapIb.StreamSettings,
 				Sniffing:             snapIb.Sniffing,
 				TrafficReset:         snapIb.TrafficReset,
@@ -839,6 +851,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				}
 			}
 			newInboundIDs[newIb.Id] = struct{}{}
+			recordProxyMatch(newIb.Id, snapIb)
 			structuralChange = true
 			continue
 		}
@@ -848,7 +861,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 		// Adopting the node's settings verbatim would re-add a client the master
 		// deleted moments ago if this snapshot was fetched before the deletion
 		// push landed — filter just-deleted emails out while their tombstone lives.
-		adoptedSettings := snapIb.Settings
+		adoptedSettings, _ := model.StripInboundProxyBandwidthBindings(snapIb.Protocol, snapIb.Settings)
 		if stripped, changed := stripTombstonedClients(adoptedSettings); changed {
 			adoptedSettings = stripped
 		}
@@ -904,6 +917,9 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				Updates(updates).Error; err != nil {
 				return false, err
 			}
+		}
+		if _, degraded := degradedInbounds[c.Id]; !degraded {
+			recordProxyMatch(c.Id, snapIb)
 		}
 	}
 
@@ -1436,6 +1452,9 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 		logger.Warning("setRemoteTraffic: lift activated expiries failed:", err)
 	}
 
+	if err := reconcileRemoteBandwidthProxyBindings(tx, nodeID, snap, matchedProxyInbounds, lifecycleFrozen, selfKey); err != nil {
+		return false, err
+	}
 	if err := tx.Commit().Error; err != nil {
 		return false, err
 	}
